@@ -1,0 +1,197 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+from conftest import (
+    ABSENT,
+    CLIP_FRAMES,
+    ENCODERS,
+    EXPERIMENT_PMU,
+    make_ffmpeg_log,
+    make_perf_json,
+    make_pidstat,
+    make_time_json,
+    read_capture,
+)
+from run_artifacts import (
+    ArtifactError,
+    parse_ffmpeg_log,
+    parse_perf,
+    parse_pidstat,
+    parse_time,
+)
+
+
+@pytest.mark.parametrize("encoder", ENCODERS)
+class TestTheRealTools:
+    def test_the_format_string_and_the_model_agree_on_every_field(self, encoder):
+        time = parse_time(read_capture(encoder, "time.json"))
+
+        assert time.exit_status == 0
+        assert time.elapsed_s > 0
+        assert time.max_rss_kb > 0
+
+    def test_every_counter_of_the_perf_stat_comes_out_numeric_or_absent(self, encoder):
+        counters = parse_perf(read_capture(encoder, "perf.json"))
+
+        # A ponte entre o `-e` que o `run_scenario.sh` passou e as colunas que a
+        # tabela declara: trocar um evento de um lado só deixaria a métrica vazia
+        # para a campanha inteira, e o `perf stat` não reclama disso.
+        assert set(counters) == set(EXPERIMENT_PMU.events)
+        assert all(counter.value is None or counter.value > 0 for counter in counters.values())
+
+    def test_the_fraction_of_time_each_counter_ran_is_read(self, encoder):
+        # Com o contador rodando menos de 100% do tempo, o valor é estimativa
+        # extrapolada, e sem esta coluna uma estimativa e uma contagem ficam
+        # indistinguíveis no Parquet.
+        counters = parse_perf(read_capture(encoder, "perf.json"))
+
+        assert all(counter.pcnt_running == 100.0 for counter in counters.values())
+
+    def test_the_absent_counters_are_exactly_the_unsupported_ones(self, encoder):
+        # A captura vem sem PMU (o Docker Desktop do macOS não a expõe ao guest), então ela
+        # traz o `<not supported>` que o `perf` de verdade escreve. Quando ela for
+        # regenerada onde há PMU os dois lados ficam vazios, e é por isso que a
+        # rejeição determinística continua na factory abaixo.
+        raw = read_capture(encoder, "perf.json")
+        counters = parse_perf(raw)
+
+        assert {event for event, counter in counters.items() if counter.value is None} == {
+            json.loads(line)["event"] for line in raw.splitlines() if "<not supported>" in line
+        }
+
+    def test_the_cpu_series_has_one_entry_per_sample(self, encoder):
+        # O `pidstat -h` de verdade **repete o cabeçalho antes de cada amostra**,
+        # coisa que a factory nunca fez: um parser que pulasse só o primeiro
+        # contaria cabeçalho como medição.
+        raw = read_capture(encoder, "pidstat.txt")
+        samples = [line for line in raw.splitlines() if line.endswith("ffmpeg")]
+
+        series = parse_pidstat(raw)
+
+        assert len(series) == len(samples)
+        assert all(sample > 0 for sample in series)
+
+    def test_the_last_stats_line_counts_every_frame_of_the_clip(self, encoder):
+        # O `-stats` reescreve a mesma linha com `\r`, e no FFmpeg de verdade a
+        # última ainda vem depois do resumo de muxing: ler qualquer outra
+        # reportaria como total do encode o que ele tinha feito no meio.
+        stats = parse_ffmpeg_log(read_capture(encoder, "ffmpeg.log"))
+
+        assert stats.frames == CLIP_FRAMES
+        assert stats.fps > 0
+        assert stats.bitrate_kbps > 0
+
+
+class TestTime:
+    def test_integer_seconds_are_accepted(self):
+        # O `%e` de um encode instantâneo sai como `0`, e um modelo que exigisse
+        # decimal derrubaria o run em vez de medi-lo.
+        assert parse_time(make_time_json(elapsed_s=0)).elapsed_s == 0.0
+
+    def test_a_renamed_field_is_rejected(self):
+        # O format string mora no bash: renomear uma chave lá deixaria a coluna
+        # vazia para a campanha inteira se o parser aceitasse o que sobrou.
+        with pytest.raises(ArtifactError, match="elapsed_s"):
+            parse_time(make_time_json(elapsed_s=ABSENT))
+
+    def test_a_field_the_model_does_not_know_is_rejected(self):
+        with pytest.raises(ArtifactError, match="cpu_pct"):
+            parse_time(make_time_json(cpu_pct=99.0))
+
+    def test_a_number_written_as_string_is_rejected(self):
+        with pytest.raises(ArtifactError, match="max_rss_kb"):
+            parse_time(make_time_json(max_rss_kb="524288"))
+
+    def test_content_that_is_not_json_is_rejected(self):
+        # O `--quiet` some da invocação e o GNU time prefixa "Command exited with
+        # non-zero status": é assim que o `time.json` deixa de ser JSON.
+        with pytest.raises(ArtifactError):
+            parse_time("Command exited with non-zero status 1\n" + make_time_json())
+
+
+class TestPerf:
+    def test_a_header_line_is_skipped(self):
+        # O cabeçalho do `perf stat -j` varia com a versão, e é por isso que o
+        # `run_scenario.sh` confere o arquivo textualmente.
+        counters = parse_perf(make_perf_json(header='{"cpu" : "0", "thread" : "ffmpeg"}'))
+
+        assert counters["cycles"].value == 4_000_000_000.0
+
+    def test_an_unsupported_event_comes_out_absent_not_zero(self):
+        # `perf stat` não falha quando o evento não existe na arquitetura; zero
+        # entraria numa média como medição.
+        counters = parse_perf(make_perf_json({"cycles": "<not supported>"}))
+
+        assert counters["cycles"].value is None
+
+    def test_the_modifier_perf_appends_to_the_event_still_names_the_column(self):
+        # `perf` ecoa o evento com o modificador que aplicou, e as duas guardas do
+        # `run_scenario.sh` e do `preflight` já o descartam: mantê-lo aqui faria a
+        # coluna daquele evento sair nula num run que as duas aprovaram.
+        counters = parse_perf(make_perf_json({"cycles:u": 4e9}))
+
+        assert counters["cycles"].value == 4_000_000_000.0
+
+    def test_a_counter_that_never_ran_comes_out_absent_not_zero(self):
+        # `<not counted>` é o segundo modo de falha, e o `perf` também não falha
+        # nele: o contador abriu e o kernel nunca o escalonou.
+        counters = parse_perf(make_perf_json({"cycles": "<not counted>"}))
+
+        assert counters["cycles"].value is None
+
+    def test_a_counter_that_ran_a_fraction_of_the_time_keeps_the_fraction(self):
+        counters = parse_perf(make_perf_json(pcnt_running=33.33))
+
+        assert counters["cycles"].pcnt_running == 33.33
+
+    def test_a_perf_that_does_not_report_the_fraction_leaves_it_absent(self):
+        counters = parse_perf(make_perf_json(pcnt_running=None))
+
+        assert counters["cycles"].value == 4_000_000_000.0
+        assert counters["cycles"].pcnt_running is None
+
+    def test_an_absent_event_is_absent_from_the_mapping(self):
+        counters = parse_perf(make_perf_json({"instructions": 1.0}))
+
+        assert "cycles" not in counters
+
+    def test_content_without_a_single_counter_is_rejected(self):
+        with pytest.raises(ArtifactError):
+            parse_perf("Performance counter stats for 'ffmpeg':\n")
+
+
+class TestPidstat:
+    def test_the_cpu_series_comes_out_in_order(self):
+        assert parse_pidstat(make_pidstat()) == [98.0, 96.0, 94.0]
+
+    def test_the_column_is_found_by_name_not_by_position(self):
+        # `-h -r -u` fixa as colunas hoje; um flag a mais amanhã as desloca, e
+        # índice cravado leria `%MEM` como se fosse `%CPU`.
+        shifted = make_pidstat().replace("   %CPU   CPU", "   CPU   %CPU")
+
+        assert parse_pidstat(shifted) != parse_pidstat(make_pidstat())
+
+    def test_the_average_line_is_not_a_sample(self):
+        raw = make_pidstat() + "Average:       0      4242   92.00    6.00  ffmpeg\n"
+
+        assert parse_pidstat(raw) == [98.0, 96.0, 94.0]
+
+    def test_a_header_that_never_arrived_is_rejected(self):
+        # `pidstat` morto antes do primeiro flush deixa o arquivo com bytes que
+        # não são amostra nenhuma; devolver série vazia diria "0% de CPU".
+        with pytest.raises(ArtifactError):
+            parse_pidstat("Linux 6.8.0-31-generic (ip-10-0-0-1) \t08/08/2026\n")
+
+
+class TestFfmpegLog:
+    def test_a_bitrate_the_ffmpeg_did_not_compute_comes_out_absent(self):
+        stats = parse_ffmpeg_log(make_ffmpeg_log(bitrate="N/A"))
+
+        assert stats.frames == 7200
+        assert stats.bitrate_kbps is None
+
+    def test_a_log_without_progress_is_rejected(self):
+        with pytest.raises(ArtifactError):
+            parse_ffmpeg_log("ffmpeg version n7.1\nUnknown encoder 'libsvtav1'\n")

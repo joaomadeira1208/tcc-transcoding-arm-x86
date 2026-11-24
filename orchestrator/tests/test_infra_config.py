@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import pytest
+from conftest import ABSENT, make_infra
+from infra_config import InfraError, parse_infra
+
+SECTIONS = ("security_groups", "instance_profiles", "amis", "buckets")
+
+NESTED_FIELDS = [
+    ("security_groups", "orchestrator"),
+    ("security_groups", "ephemeral"),
+    ("instance_profiles", "orchestrator"),
+    ("instance_profiles", "encode"),
+    ("instance_profiles", "judge"),
+    ("instance_profiles", "masters"),
+    ("amis", "orchestrator"),
+    ("amis", "encode_amd64"),
+    ("amis", "encode_arm64"),
+    ("buckets", "campaign"),
+    ("buckets", "pilot"),
+]
+
+
+def message(payload) -> str:
+    with pytest.raises(InfraError) as raised:
+        parse_infra(payload)
+    return str(raised.value)
+
+
+class TestTheFileTheBootstrapWrites:
+    def test_the_documented_shape_is_accepted(self):
+        infra = parse_infra(make_infra())
+
+        assert infra.subnet_id == "subnet-0a1b2c3d4e5f60718"
+        assert infra.key_pair_name == "transcoding-bench"
+        assert infra.ssh_private_key_parameter_name == (
+            "/transcoding-bench/orchestrator/ssh-private-key"
+        )
+
+    def test_the_fields_prepare_masters_launches_with(self):
+        infra = parse_infra(make_infra())
+
+        assert infra.security_groups.ephemeral == "sg-0b2c3d4e5f6071829"
+        assert infra.instance_profiles.masters == "transcoding-bench-masters"
+        assert infra.amis.encode_arm64 == "ami-0246d714afcc1d494"
+        assert infra.buckets.campaign == "transcoding-bench-123456789012-campaign"
+        assert infra.buckets.pilot == "transcoding-bench-123456789012-pilot"
+        assert list(infra.buckets.by_role) == ["campaign", "pilot"]
+
+    def test_a_payload_that_is_not_an_object_is_rejected(self):
+        assert message([]) != ""
+
+    def test_a_key_the_terraform_added_later_is_ignored(self):
+        assert parse_infra(make_infra(region="us-east-1")).subnet_id != ""
+
+
+class TestMissingFields:
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "subnet_id",
+            "security_groups",
+            "instance_profiles",
+            "key_pair_name",
+            "amis",
+            "buckets",
+            "ssh_private_key_parameter_name",
+        ],
+    )
+    def test_a_missing_top_level_key_is_rejected_naming_it(self, key):
+        assert key in message(make_infra(**{key: ABSENT}))
+
+    @pytest.mark.parametrize(("section", "field"), NESTED_FIELDS)
+    def test_a_missing_nested_key_is_rejected_naming_it(self, section, field):
+        payload = make_infra()
+        del payload[section][field]
+
+        assert f"{section}.{field}" in message(payload)
+
+    @pytest.mark.parametrize("section", SECTIONS)
+    def test_a_section_that_is_not_an_object_is_rejected(self, section):
+        assert section in message(make_infra(**{section: "sg-0b2c3d4e5f6071829"}))
+
+
+class TestTheBucketsOfEveryExperiment:
+    # Um bucket por experimento, e o mapa cresce a cada `apply` do
+    # `storage/`: um parser que só conhecesse os dois primeiros perderia os novos
+    # da auto-checagem sem nada acusar.
+
+    def test_the_buckets_beyond_the_campaign_and_the_pilot_are_kept_by_name(self):
+        payload = make_infra()
+        payload["buckets"]["topologia"] = "transcoding-bench-123456789012-topologia"
+
+        buckets = parse_infra(payload).buckets
+
+        assert buckets.by_role["topologia"] == "transcoding-bench-123456789012-topologia"
+        assert list(buckets.by_role) == ["campaign", "pilot", "topologia"]
+
+    @pytest.mark.parametrize("value", ["", None, 7])
+    def test_a_new_bucket_that_is_not_a_name_is_rejected_naming_it(self, value):
+        payload = make_infra()
+        payload["buckets"]["contadores"] = value
+
+        assert "buckets.contadores" in message(payload)
+
+
+class TestValuesThatAreNotIdentifiers:
+    @pytest.mark.parametrize(("section", "field"), NESTED_FIELDS)
+    def test_an_empty_nested_value_is_rejected_naming_it(self, section, field):
+        payload = make_infra()
+        payload[section][field] = ""
+
+        assert f"{section}.{field}" in message(payload)
+
+    def test_an_empty_top_level_value_is_rejected_naming_it(self):
+        assert "subnet_id" in message(make_infra(subnet_id=""))
+
+    def test_a_value_that_is_not_a_string_is_rejected(self):
+        # O `null` do `jq` sobre um output que o Terraform não produziu chega
+        # aqui como `None`, e `f"--subnet-id {None}"` é um argv plausível.
+        assert "subnet_id" in message(make_infra(subnet_id=None))

@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import pytest
+from conftest import REPO_ROOT
+from meta_check import MetaError, check_meta
+
+ANCHOR = REPO_ROOT / "analysis" / "tests" / "fixtures" / "campaign_meta.json"
+
+VALID_META_JSON = """{
+  "schema_version": "1",
+  "scenario_id": "libx264_2160p_1080p_bbb_c7g_rep1",
+  "warmup": false,
+  "seed": 20260808,
+  "codec": "h264",
+  "encoder": "libx264",
+  "input_res": "2160p",
+  "output_res": "1080p",
+  "video": "bbb",
+  "instance": "c7g",
+  "master": "bbb_2160p.mkv",
+  "output_width": 1920,
+  "output_height": 1080,
+  "preset": "medium",
+  "crf": 23,
+  "encoder_args": ["-sc_threshold", "0"],
+  "threads": 0,
+  "gop_size": 48,
+  "pix_fmt": "yuv420p",
+  "strip_audio": true,
+  "container": "mkv",
+  "scale_flags": "lanczos",
+  "run_id": "9f0c4a2e-6b41-4d5f-8a37-2f1c8de0b7a4",
+  "started_at": "2026-08-08T10:00:00+00:00",
+  "finished_at": "2026-08-08T10:12:31+00:00",
+  "exit_code": 0,
+  "commit": "ffd4f43a1b2c3d4e5f60718293a4b5c6d7e8f900",
+  "instance_id": "i-0123456789abcdef0",
+  "instance_type": "c7g.xlarge",
+  "versions": {
+    "ffmpeg": "n7.1",
+    "libx264": "31e19f92",
+    "libx265": "4.1",
+    "libsvtav1": "v2.3.0",
+    "libvmaf": "v3.0.0"
+  }
+}
+"""
+
+# O mesmo arquivo, com o `warmup` escrito como string.
+INVALID_META_JSON = VALID_META_JSON.replace('"warmup": false', '"warmup": "false"')
+
+# E com o `commit` presente e vazio, que é o que `jq -r` escreve sobre uma chave
+# que o bash não conseguiu preencher: o `--exclude-commit` da retomada compara
+# esse campo, e um leitor que o aceitasse vazio casaria com nada em silêncio.
+EMPTY_COMMIT_JSON = VALID_META_JSON.replace(
+    '"commit": "ffd4f43a1b2c3d4e5f60718293a4b5c6d7e8f900"', '"commit": ""'
+)
+
+
+def test_the_valid_meta_is_accepted():
+    assert check_meta(VALID_META_JSON)["warmup"] is False
+
+
+def test_the_meta_the_bash_wrote_in_the_pilot_is_accepted():
+    meta = check_meta(ANCHOR.read_bytes())
+
+    assert meta["warmup"] is False
+    assert meta["scenario_id"] == "libx265_1080p_720p_bbb_c7a_rep1"
+    assert meta["exit_code"] == 0
+
+
+def test_the_invalid_meta_is_rejected():
+    with pytest.raises(MetaError, match="warmup"):
+        check_meta(INVALID_META_JSON)
+
+
+def test_the_empty_commit_is_rejected():
+    with pytest.raises(MetaError, match="commit"):
+        check_meta(EMPTY_COMMIT_JSON)

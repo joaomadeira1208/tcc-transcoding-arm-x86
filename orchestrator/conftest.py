@@ -1,0 +1,575 @@
+# O `conftest.py` no nível do papel é o que torna o núcleo importável pelos testes
+# sem `pyproject.toml` e sem `sys.path` manipulado: o pytest insere no `sys.path`
+# o diretório de cada `conftest.py` que coleta.
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import tomllib
+from pathlib import Path
+from typing import Any
+
+import pytest
+from command_output import DescribedInstance
+from experiment_config import ExperimentConfig, validate_config
+from masters_plan import build_masters_plan, iter_masters
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+REAL_EXPERIMENT_TOML = REPO_ROOT / "config" / "experiment.toml"
+REAL_PILOT_TOML = REPO_ROOT / "config" / "pilot.toml"
+
+
+def real_config() -> ExperimentConfig:
+    return _real_config(REAL_EXPERIMENT_TOML)
+
+
+def real_pilot_config() -> ExperimentConfig:
+    return _real_config(REAL_PILOT_TOML)
+
+
+def every_real_definition() -> list[ExperimentConfig]:
+    return [_real_config(path) for path in sorted(REAL_EXPERIMENT_TOML.parent.glob("*.toml"))]
+
+
+def _real_config(path: Path) -> ExperimentConfig:
+    with path.open("rb") as handle:
+        return validate_config(tomllib.load(handle))
+
+
+_MINIMAL: dict[str, Any] = {
+    "experiment": {"seed": 1, "replications": 5, "warmup_runs": 1},
+    "encode": {
+        "threads": 0,
+        "gop_size": 48,
+        "pix_fmt": "yuv420p",
+        "strip_audio": True,
+        "container": "mkv",
+        "scale_flags": "lanczos",
+    },
+    "codec": [
+        {
+            "slug": "libx264",
+            "codec": "h264",
+            "encoder": "libx264",
+            "preset": "medium",
+            "crf": 23,
+            "encoder_args": ["-sc_threshold", "0"],
+            "bitstream_muxer": "h264",
+        }
+    ],
+    # Um evento de software entre os de hardware: é o que faz o mínimo exercitar
+    # a regra do zero, que vale para uns e não para os outros.
+    "instrumentation": {
+        "pmu_events": ["cycles", "instructions", "context-switches"],
+        "metric": [
+            {
+                "name": "ipc",
+                "numerator": "instructions",
+                "denominator": "cycles",
+                "max_ratio": 10.0,
+            }
+        ],
+    },
+    "pair": [
+        {"input_res": "1080p", "output_res": "1080p"},
+        {"input_res": "1080p", "output_res": "720p"},
+    ],
+    "video": [
+        {
+            "slug": "bbb",
+            "title": "Big Buck Bunny",
+            "frame_rate": "30/1",
+            "frames": 19036,
+            "geometry": {
+                "1080p": {"width": 1920, "height": 1080},
+                "720p": {"width": 1280, "height": 720},
+            },
+            "source": {
+                "url": (
+                    "https://download.blender.org/demo/movies/BBB/"
+                    "bbb_sunflower_2160p_30fps_normal.mp4.zip"
+                ),
+                "file": "bbb_sunflower_2160p_30fps_normal.mp4",
+                "size": 633016449,
+                "sha256": "37f0ff251a606c2dcfa26c19fe6bf843234b4e7a8889cfab50bc26f644e55520",
+            },
+        }
+    ],
+    "instance": [{"id": "c7g", "instance_type": "c7g.xlarge", "arch": "arm64"}],
+    "quality": {
+        "vmaf_model": "vmaf_v0.6.1",
+        "vmaf_delta_max": 0.5,
+        "ssim_delta_max": 0.001,
+        "judge": {"instance_type": "c7i.4xlarge", "arch": "x86_64"},
+    },
+}
+
+
+_VALID_META: dict[str, Any] = {
+    "schema_version": "1",
+    "scenario_id": "libx264_2160p_1080p_bbb_c7g_rep1",
+    "warmup": False,
+    "seed": 20260808,
+    "codec": "h264",
+    "encoder": "libx264",
+    "input_res": "2160p",
+    "output_res": "1080p",
+    "video": "bbb",
+    "instance": "c7g",
+    "master": "bbb_2160p.mkv",
+    "output_width": 1920,
+    "output_height": 1080,
+    "preset": "medium",
+    "crf": 23,
+    "encoder_args": ["-sc_threshold", "0"],
+    "threads": 0,
+    "gop_size": 48,
+    "pix_fmt": "yuv420p",
+    "strip_audio": True,
+    "container": "mkv",
+    "scale_flags": "lanczos",
+    "run_id": "9f0c4a2e-6b41-4d5f-8a37-2f1c8de0b7a4",
+    "started_at": "2026-08-08T10:00:00+00:00",
+    "finished_at": "2026-08-08T10:12:31+00:00",
+    "exit_code": 0,
+    "commit": "ffd4f43a1b2c3d4e5f60718293a4b5c6d7e8f900",
+    "instance_id": "i-0123456789abcdef0",
+    "instance_type": "c7g.xlarge",
+    "versions": {
+        "ffmpeg": "n7.1",
+        "libx264": "31e19f92",
+        "libx265": "4.1",
+        "libsvtav1": "v2.3.0",
+        "libvmaf": "v3.0.0",
+    },
+}
+
+
+def make_meta(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_VALID_META, overrides)
+
+
+def make_meta_json(**overrides: Any) -> str:
+    return json.dumps(make_meta(**overrides), indent=2) + "\n"
+
+
+_VALID_PLAN_OUTPUT: dict[str, Any] = {
+    "run_id": _VALID_META["run_id"],
+    "scenario_id": _VALID_META["scenario_id"],
+    "codec": "h264",
+    "encoder": "libx264",
+    "input_res": "2160p",
+    "output_res": "1080p",
+    "video": "bbb",
+    "instance": "c7g",
+    "sha256": "3d2f7c1a90b4e5d68f2a1c0b7e9d4a35c6f8091b2d3e4f5061728394a5b6c7d8",
+    "master": "bbb_2160p.mkv",
+    "output_width": 1920,
+    "output_height": 1080,
+    "scale_flags": "lanczos",
+    "container": "mkv",
+    "frames": 19036,
+    "shared_by": [
+        {
+            "instance": "c7g",
+            "scenario_id": _VALID_META["scenario_id"],
+            "run_id": _VALID_META["run_id"],
+        }
+    ],
+    "cell_divergent": False,
+}
+
+_VALID_QUALITY_PLAN: dict[str, Any] = {
+    "schema_version": "1",
+    "quality": {
+        "vmaf_model": "vmaf_v0.6.1",
+        "vmaf_delta_max": 0.5,
+        "ssim_delta_max": 0.001,
+    },
+    "outputs": [_VALID_PLAN_OUTPUT],
+}
+
+
+def make_plan_output(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_VALID_PLAN_OUTPUT, overrides)
+
+
+def make_quality_plan(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_VALID_QUALITY_PLAN, overrides)
+
+
+def make_quality_plan_json(**overrides: Any) -> str:
+    return json.dumps(make_quality_plan(**overrides), indent=2) + "\n"
+
+
+_VALID_JUDGEMENT: dict[str, Any] = {
+    "schema_version": "1",
+    **copy.deepcopy(_VALID_PLAN_OUTPUT),
+    "started_at": "2026-09-14T11:02:00+00:00",
+    "finished_at": "2026-09-14T11:43:18+00:00",
+    "exit_code": 0,
+    "commit": _VALID_META["commit"],
+    "instance_id": "i-0123456789abcdef0",
+    "instance_type": "c7i.4xlarge",
+    "versions": copy.deepcopy(_VALID_META["versions"]),
+}
+
+
+def make_judgement(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_VALID_JUDGEMENT, overrides)
+
+
+def make_judgement_json(**overrides: Any) -> str:
+    return json.dumps(make_judgement(**overrides), indent=2) + "\n"
+
+
+_VALID_PROGRESS: dict[str, Any] = {
+    "instance_id": "i-0123456789abcdef0",
+    "block_index": 4,
+    "block_count": 6,
+    "run_index": 3,
+    "run_count": 6,
+    "scenario_id": "libx265_1080p_720p_tos_c7g_rep2",
+    "runs_total": 21,
+    "runs_failed": 0,
+    "elapsed_seconds": 4200,
+    "written_at": "2026-09-07T14:32:07+00:00",
+}
+
+_VALID_DONE_MARKER: dict[str, Any] = {
+    "instance_id": "i-0123456789abcdef0",
+    "finished_at": "2026-09-07T14:32:07+00:00",
+    "runs_total": 36,
+    "runs_failed": 0,
+    "capped": False,
+    "exit_status": 0,
+}
+
+
+_VALID_JUDGE_PROGRESS: dict[str, Any] = {
+    "instance_id": "i-0123456789abcdef0",
+    "output_index": 7,
+    "output_count": 13,
+    "run_id": "4b1d8e07-2c36-4a59-9f80-51ac7e2d6b43",
+    "scenario_id": "libx265_1080p_720p_tos_c7i_rep1",
+    "runs_total": 7,
+    "runs_failed": 0,
+    "elapsed_seconds": 2460,
+    "written_at": "2026-09-14T14:32:07+00:00",
+}
+
+
+def make_judge_progress(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_VALID_JUDGE_PROGRESS, overrides)
+
+
+def make_progress(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_VALID_PROGRESS, overrides)
+
+
+def make_done_marker(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_VALID_DONE_MARKER, overrides)
+
+
+def _overridden(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(base)
+    for field, value in overrides.items():
+        if value is _ABSENT:
+            payload.pop(field, None)
+        else:
+            payload[field] = value
+    return payload
+
+
+_OBSERVED_MASTER_SIZE = 1073741824
+
+
+def make_manifest(**overrides: Any) -> dict[str, Any]:
+    plan = build_masters_plan(real_config())
+    manifest = {
+        "schema_version": "1",
+        "versions": copy.deepcopy(_VALID_META["versions"]),
+        "sources": {video["video"]: dict(video["source"]) for video in plan["videos"]},
+        "masters": [_observed(master) for master in iter_masters(plan)],
+    }
+    return manifest | overrides
+
+
+def manifest_master(manifest: dict[str, Any], name: str) -> dict[str, Any]:
+    matches = [master for master in manifest["masters"] if master["name"] == name]
+
+    assert len(matches) == 1, name
+    return matches[0]
+
+
+def _observed(master: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": master["name"],
+        "size": _OBSERVED_MASTER_SIZE,
+        "sha256": hashlib.sha256(master["name"].encode()).hexdigest(),
+        **{field: value for field, value in master.items() if field != "name"},
+    }
+
+
+def make_geometry(**tiers: tuple[int, int]) -> dict[str, dict[str, int]]:
+    return {tier: {"width": w, "height": h} for tier, (w, h) in tiers.items()}
+
+
+def make_codec(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["codec"][0]), **overrides}
+
+
+def make_video(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["video"][0]), **overrides}
+
+
+def make_source(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["video"][0]["source"]), **overrides}
+
+
+def make_instance(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["instance"][0]), **overrides}
+
+
+def make_experiment(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["experiment"]), **overrides}
+
+
+def make_encode(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["encode"]), **overrides}
+
+
+def make_quality(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["quality"]), **overrides}
+
+
+def make_judge(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["quality"]["judge"]), **overrides}
+
+
+def make_instrumentation(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["instrumentation"]), **overrides}
+
+
+def make_metric(**overrides: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(_MINIMAL["instrumentation"]["metric"][0]), **overrides}
+
+
+@pytest.fixture
+def make_raw_config():
+    def _make(**overrides: Any) -> dict[str, Any]:
+        return _overridden(_MINIMAL, overrides)
+
+    return _make
+
+
+class _Absent:
+    def __repr__(self) -> str:  # pragma: no cover - só aparece em falha de teste
+        return "<absent>"
+
+
+_ABSENT = _Absent()
+ABSENT: Any = _ABSENT
+
+
+FIXTURES = REPO_ROOT / "orchestrator" / "tests" / "fixtures"
+
+
+def captured(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+# Payloads montados em código, e não substituíveis pelos capturados de
+# `tests/fixtures/`: a API nunca devolve um lançamento sem `InstanceId` nem com
+# duas instâncias, e é isso que os parsers recusam.
+
+
+def make_launched_instance(instance_id: str = "i-0123456789abcdef0") -> dict[str, Any]:
+    return {
+        "AmiLaunchIndex": 0,
+        "ImageId": "ami-0abcdef1234567890",
+        "InstanceId": instance_id,
+        "InstanceType": "c7g.xlarge",
+        "KeyName": "transcoding-bench",
+        "LaunchTime": "2026-09-07T12:00:00+00:00",
+        "PrivateIpAddress": "10.0.1.42",
+        "State": {"Code": 0, "Name": "pending"},
+        "SubnetId": "subnet-0a1b2c3d4e5f60718",
+    }
+
+
+def make_run_instances_payload(*instances: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "Groups": [],
+            "Instances": list(instances),
+            "OwnerId": "123456789012",
+            "ReservationId": "r-0a1b2c3d4e5f60718",
+        }
+    )
+
+
+def make_described_instance(
+    instance_id: str = "i-0123456789abcdef0",
+    state: str = "running",
+    public_ip: str | None = "203.0.113.2",
+    private_ip: str | None = "10.0.1.42",
+) -> dict[str, Any]:
+    instance = {
+        "ImageId": "ami-0abcdef1234567890",
+        "InstanceId": instance_id,
+        "InstanceType": "c7g.xlarge",
+        "KeyName": "transcoding-bench",
+        "LaunchTime": "2026-09-07T12:00:00+00:00",
+        "State": {"Code": 16, "Name": state},
+        "StateTransitionReason": "",
+        "SubnetId": "subnet-0a1b2c3d4e5f60718",
+    }
+    if public_ip is not None:
+        instance["PublicIpAddress"] = public_ip
+    if private_ip is not None:
+        instance["PrivateIpAddress"] = private_ip
+    return instance
+
+
+def make_describe_payload(*reservations: list[dict[str, Any]]) -> str:
+    return json.dumps(
+        {
+            "Reservations": [
+                {
+                    "Groups": [],
+                    "Instances": instances,
+                    "OwnerId": "123456789012",
+                    "ReservationId": "r-0a1b2c3d4e5f60718",
+                }
+                for instances in reservations
+            ]
+        }
+    )
+
+
+CALLER_ARN = "arn:aws:sts::123456789012:assumed-role/transcoding-bench-orchestrator/i-0abc"
+
+
+def make_caller_identity_payload(**overrides: Any) -> str:
+    payload = {
+        "UserId": "AROAEXAMPLEID:i-0abc",
+        "Account": "123456789012",
+        "Arn": CALLER_ARN,
+    }
+    return json.dumps(payload | overrides)
+
+
+def make_s3_object(key: str, size: int = 4096) -> dict[str, Any]:
+    return {
+        "Key": key,
+        "LastModified": "2026-09-07T12:00:00+00:00",
+        "ETag": '"9f0c4a2e6b414d5f8a372f1c8de0b7a4"',
+        "Size": size,
+        "StorageClass": "STANDARD",
+    }
+
+
+def make_list_objects_payload(*contents: dict[str, Any], **overrides: Any) -> str:
+    payload: dict[str, Any] = {
+        "Contents": list(contents),
+        "IsTruncated": False,
+        "KeyCount": len(contents),
+        "MaxKeys": 1000,
+        "Name": "transcoding-bench-runs",
+        "Prefix": "runs/",
+    }
+    return json.dumps(payload | overrides)
+
+
+def make_instance_state(
+    state: str = "running",
+    public_ip: str | None = "203.0.113.2",
+    private_ip: str | None = "10.0.1.42",
+) -> DescribedInstance:
+    return DescribedInstance(
+        instance_id="i-0123456789abcdef0",
+        state=state,
+        public_ip=public_ip,
+        private_ip=private_ip,
+    )
+
+
+_INFRA: dict[str, Any] = {
+    "subnet_id": "subnet-0a1b2c3d4e5f60718",
+    "security_groups": {
+        "orchestrator": "sg-0a1b2c3d4e5f60718",
+        "ephemeral": "sg-0b2c3d4e5f6071829",
+    },
+    "instance_profiles": {
+        "orchestrator": "transcoding-bench-orchestrator",
+        "encode": "transcoding-bench-encode",
+        "judge": "transcoding-bench-judge",
+        "masters": "transcoding-bench-masters",
+    },
+    "key_pair_name": "transcoding-bench",
+    "amis": {
+        "orchestrator": "ami-025d99823a4caad37",
+        "encode_amd64": "ami-025d99823a4caad37",
+        "encode_arm64": "ami-0246d714afcc1d494",
+    },
+    "buckets": {
+        "campaign": "transcoding-bench-123456789012-campaign",
+        "pilot": "transcoding-bench-123456789012-pilot",
+    },
+    "ssh_private_key_parameter_name": "/transcoding-bench/orchestrator/ssh-private-key",
+}
+
+
+def make_infra(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_INFRA, overrides)
+
+
+# Os totais são os da fatia do piloto, os mesmos que a linha de progresso
+# do `watch` mostra.
+
+_TRACKED_INSTANCE: dict[str, Any] = {
+    "role": "encode",
+    "instance": "c7g",
+    "instance_id": "i-0123456789abcdef0",
+    "instance_type": "c7g.xlarge",
+    "pid": 4242,
+    "block_count": 6,
+    "runs_total": 36,
+    "commit": _VALID_META["commit"],
+    "total_timeout": 120 * 60 * 60,
+    "state": "running",
+    "outcome": None,
+    "cpu_options": None,
+}
+
+_CAMPAIGN_STATE: dict[str, Any] = {
+    "bucket": _INFRA["buckets"]["pilot"],
+    "config_path": "config/pilot.toml",
+    "commit": _VALID_META["commit"],
+    "total_timeout": 120 * 60 * 60,
+    "slice_keys": ["scenarios/c7g.json", "scenarios/c7i.json"],
+    "instances": [
+        _TRACKED_INSTANCE,
+        # A arquitetura lançada e ainda não disparada: o PID só existe depois do
+        # disparo, e é o estado em que um `watch` retomado pode encontrá-la.
+        {
+            **_TRACKED_INSTANCE,
+            "instance": "c7i",
+            "instance_id": "i-09876543210fedcba",
+            "instance_type": "c7i.xlarge",
+            "pid": None,
+            "state": "bootstrapping",
+        },
+    ],
+}
+
+
+def make_tracked_instance(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_TRACKED_INSTANCE, overrides)
+
+
+def make_campaign_state(**overrides: Any) -> dict[str, Any]:
+    return _overridden(_CAMPAIGN_STATE, overrides)

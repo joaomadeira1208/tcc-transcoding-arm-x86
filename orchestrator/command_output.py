@@ -1,0 +1,195 @@
+"""Leitura da saída dos comandos externos — funções puras, sem I/O."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
+from experiment_config import CpuOptions
+
+
+class OutputError(Exception):
+    """Saída de comando externo que o Orquestrador recusa a ler."""
+
+
+class TruncatedListing(OutputError):
+    """Listagem que não coube numa página — o `run` a lê como bucket povoado."""
+
+
+@dataclass(frozen=True)
+class DescribedInstance:
+    instance_id: str
+    state: str
+    public_ip: str | None
+    private_ip: str | None
+    cpu_options: CpuOptions | None = None
+
+
+@dataclass(frozen=True)
+class S3Object:
+    key: str
+    size: int
+
+
+class CloudInitStatus(Enum):
+    DONE = "done"
+    ERROR = "error"
+    RUNNING = "running"
+
+
+def parse_run_instances(raw: str) -> str:
+    instances = _field(_parse_object(raw, "run-instances"), "Instances", list)
+    if len(instances) != 1:
+        raise OutputError(f"run-instances: esperava exatamente 1 instância, veio {len(instances)}")
+    return _field(_as_object(instances[0], "Instances[0]"), "InstanceId", str)
+
+
+def parse_describe_instances(raw: str) -> list[DescribedInstance]:
+    """Resposta sem reservas é lista vazia: a consulta feita logo depois do
+    lançamento pode não achar a instância ainda, e isso não é erro.
+    """
+    reservations = _field(_parse_object(raw, "describe-instances"), "Reservations", list)
+    return [
+        _described_instance(instance)
+        for reservation in reservations
+        for instance in _field(_as_object(reservation, "Reservations[]"), "Instances", list)
+    ]
+
+
+def parse_list_objects(raw: str) -> list[S3Object]:
+    if not raw.strip():
+        return []
+
+    payload = _parse_object(raw, "list-objects-v2")
+    _reject_truncation(payload)
+    return [_s3_object(entry) for entry in _field(payload, "Contents", list, default=[])]
+
+
+def parse_get_parameter(raw: str) -> str:
+    """Nenhuma mensagem daqui interpola o valor: ele é a chave privada de SSH,
+    e o destino das mensagens é o log do Orquestrador.
+    """
+    parameter = _field(_parse_object(raw, "get-parameter"), "Parameter", dict)
+    value = parameter.get("Value")
+    if type(value) is not str or not value:
+        raise OutputError("get-parameter: Parameter.Value ausente ou não é uma string")
+    return value
+
+
+def parse_caller_identity(raw: str) -> str:
+    return _field(_parse_object(raw, "get-caller-identity"), "Arn", str)
+
+
+def parse_cloud_init_status(raw: str) -> CloudInitStatus:
+    for line in raw.splitlines():
+        _, marker, rest = line.partition("status:")
+        if not marker:
+            continue
+        status = rest.strip().removeprefix(DEGRADED_PREFIX)
+        if status == "disabled":
+            raise OutputError("cloud-init: desabilitado na instância, o user-data não vai rodar")
+        if status not in _CLOUD_INIT_STATUSES:
+            raise OutputError(f"cloud-init: status desconhecido: {status!r}")
+        return _CLOUD_INIT_STATUSES[status]
+
+    raise OutputError(f"cloud-init: saída sem linha de status: {raw.strip()[:120]!r}")
+
+
+def parse_dispatched_pid(raw: str) -> int:
+    """Positivo pelo mesmo motivo do arquivo de estado: é para um `kill -0`, onde
+    `0` é o process group de quem chama e `-1` todo processo alcançável.
+    """
+    tokens = raw.split()
+    refusal = f"disparo: esperava um PID no stdout, veio {raw.strip()[:120]!r}"
+    if len(tokens) != 1:
+        raise OutputError(refusal)
+    try:
+        pid = int(tokens[0])
+    except ValueError as error:
+        raise OutputError(refusal) from error
+    if pid <= 0:
+        raise OutputError(f"disparo: esperava PID positivo, veio {pid}")
+    return pid
+
+
+def _s3_object(entry: Any) -> S3Object:
+    content = _as_object(entry, "Contents[]")
+    return S3Object(key=_field(content, "Key", str), size=_field(content, "Size", int))
+
+
+def _described_instance(instance: Any) -> DescribedInstance:
+    described = _as_object(instance, "Instances[]")
+    return DescribedInstance(
+        instance_id=_field(described, "InstanceId", str),
+        state=_field(_field(described, "State", dict), "Name", str),
+        public_ip=_optional_field(described, "PublicIpAddress", str),
+        private_ip=_optional_field(described, "PrivateIpAddress", str),
+        cpu_options=_cpu_options(_optional_field(described, "CpuOptions", dict)),
+    )
+
+
+def _cpu_options(raw: dict[str, Any] | None) -> CpuOptions | None:
+    if raw is None:
+        return None
+    return CpuOptions(
+        core_count=_field(raw, "CoreCount", int),
+        threads_per_core=_field(raw, "ThreadsPerCore", int),
+    )
+
+
+# `degraded` é prefixo e não estado: o boot concluiu com erro recuperável, e
+# tratá-lo como token desconhecido derruba um lançamento saudável.
+DEGRADED_PREFIX = "degraded "
+
+_CLOUD_INIT_STATUSES = {
+    "done": CloudInitStatus.DONE,
+    "error": CloudInitStatus.ERROR,
+    "running": CloudInitStatus.RUNNING,
+    # Antes de o cloud-init começar; para quem espera, é o mesmo que rodando.
+    "not run": CloudInitStatus.RUNNING,
+}
+
+
+def _reject_truncation(payload: dict[str, Any]) -> None:
+    """A CLI v2 agrega as páginas sozinha, então uma listagem truncada só chega aqui
+    se alguém tiver acrescentado `--page-size`/`--max-items` ao argv — e a partir
+    daí a listagem perde chaves em silêncio.
+    """
+    if payload.get("IsTruncated") or "NextToken" in payload or "NextContinuationToken" in payload:
+        raise TruncatedListing(
+            "list-objects-v2: página truncada — a CLI v2 agrega páginas sozinha, "
+            "então isto é --page-size/--max-items no argv"
+        )
+
+
+def _parse_object(raw: str, command: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise OutputError(f"{command}: saída não é JSON válido: {error}") from error
+    return _as_object(payload, command)
+
+
+def _as_object(value: Any, where: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OutputError(f"{where}: esperava um objeto JSON, veio {type(value).__name__}")
+    return value
+
+
+def _optional_field(payload: dict[str, Any], name: str, expected: type) -> Any:
+    return _field(payload, name, expected) if name in payload else None
+
+
+_ABSENT = object()
+
+
+def _field(payload: dict[str, Any], name: str, expected: type, default: Any = _ABSENT) -> Any:
+    value = payload.get(name, default)
+    if value is _ABSENT:
+        raise OutputError(f"{name}: campo ausente na saída")
+    # Tipo exato, e não `isinstance`: `Size: true` passaria como inteiro.
+    if value is not default and type(value) is not expected:
+        raise OutputError(f"{name}: esperava {expected.__name__}, veio {value!r}")
+    return value

@@ -1,0 +1,403 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pytest
+from conftest import ARM, EXPERIMENT, REPO_ROOT, ROLE_ROOT, Execution, Pass
+
+pytestmark = pytest.mark.docker
+
+ACCEPTANCE = ROLE_ROOT / "acceptance.sh"
+JUDGE_ACCEPTANCE = ROLE_ROOT / "judge_acceptance.sh"
+FIXTURES_README = REPO_ROOT / "analysis" / "tests" / "fixtures" / "README.md"
+DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile"
+IMAGE_TAG = "transcoding-bench:acceptance"
+
+TIME_BIN = "/usr/bin/time"
+
+CONTAINER_MASTERS = "/work/masters"
+CONTAINER_OUT = "/work/out"
+
+FFMPEG = "ffmpeg"
+VMAF_LOG = "vmaf.json"
+
+# O vídeo contra ele mesmo: o que separa isto de 100 é o `libvmaf`, não o clip.
+VMAF_FLOOR = 99
+SSIM_FLOOR = 0.999
+
+LOG_PATH_OPTION = re.compile(r"log_path=[^:]+")
+SCALE = re.compile(r"scale=([0-9]+):([0-9]+):")
+
+# 5 s a 24 fps: curto o bastante para o ciclo caber em minutos, longo o bastante
+# para o `pidstat` a 1 Hz deixar mais de uma amostra.
+CLIP_SECONDS = 5
+CLIP_FPS = 24
+
+VIDEO_DELAY_FRAMES = 2
+VIDEO_DELAY_S = VIDEO_DELAY_FRAMES / CLIP_FPS
+STREAM_START = re.compile(r"Stream #1:0.*: Video: .*, start ([0-9.]+)")
+
+CAPTURED = ("time.json", "perf.json", "pidstat.txt", "ffmpeg.log")
+
+ENCODERS = [codec["encoder"] for codec in EXPERIMENT["codec"]]
+
+# Um par sem downscale, e o menor que exercite o caminho inteiro: a geometria não
+# é o que se verifica aqui, e um 2160p faria o aceite custar dezenas de minutos
+# por codec.
+TIER = "1080p"
+
+SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
+FRAMES = re.compile(r"frame=\s*([0-9]+)")
+
+
+@dataclass(frozen=True)
+class Capture:
+    returncode: int
+    stderr: str
+    out_dir: Path
+    run: dict[str, Any] = field(default_factory=dict)
+
+    def artifact(self, name: str) -> str:
+        # `errors="replace"`: o `ffmpeg.log` é stderr de terceiros, e um byte
+        # inválido nele não é motivo para a asserção não acontecer.
+        return (self.out_dir / name).read_text(encoding="utf-8", errors="replace")
+
+    def wrote(self, name: str) -> bool:
+        return (self.out_dir / name).is_file()
+
+
+def instrumentation_chain(execution: Execution, clip: str, output: str) -> list[str]:
+    chain = [TIME_BIN, *execution.argv("time")[0]]
+    for index, argument in enumerate(chain):
+        if argument == "-o":
+            chain[index + 1] = f"{CONTAINER_OUT}/{Path(chain[index + 1]).name}"
+        elif argument == "-i":
+            chain[index + 1] = clip
+        elif argument == "-e":
+            chain[index + 1] = ungrouped(chain[index + 1])
+    chain[-1] = output
+    return chain
+
+
+def ungrouped(event_spec: str) -> str:
+    return event_spec.replace("{", "").replace("}", "")
+
+
+def pidstat_arguments(execution: Execution) -> tuple[str, str]:
+    argv = execution.argv("pidstat")[0]
+    return " ".join(argv[: argv.index("-p")]), argv[-1]
+
+
+def master_geometry(run: dict[str, Any]) -> dict[str, int]:
+    video = next(video for video in EXPERIMENT["video"] if video["slug"] == run["video"])
+    return video["geometry"][run["input_res"]]
+
+
+def run_in_image(
+    image: str,
+    harness: Path,
+    out_dir: Path,
+    arguments: list[str],
+    *docker_options: str,
+) -> subprocess.CompletedProcess[str]:
+    container = f"acceptance-{uuid4().hex[:12]}"
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--name",
+                container,
+                *docker_options,
+                "--interactive",
+                image,
+                # O script chega pelo stdin: um bind-mount dependeria de o
+                # diretório do repositório estar entre os que a VM do Docker
+                # compartilha, que varia de máquina para máquina.
+                "bash",
+                "-s",
+                "--",
+                "--out-dir",
+                CONTAINER_OUT,
+                "--clip-seconds",
+                str(CLIP_SECONDS),
+                "--clip-fps",
+                str(CLIP_FPS),
+                *arguments,
+            ],
+            input=harness.read_text(encoding="utf-8"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        subprocess.run(
+            ["docker", "cp", f"{container}:{CONTAINER_OUT}/.", str(out_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        subprocess.run(["docker", "rm", "--force", container], capture_output=True, check=False)
+    return result
+
+
+@pytest.fixture(scope="session")
+def image() -> str:
+    subprocess.run(
+        ["docker", "build", "--file", str(DOCKERFILE), "--tag", IMAGE_TAG, str(DOCKERFILE.parent)],
+        check=True,
+    )
+    return IMAGE_TAG
+
+
+@pytest.fixture(scope="session")
+def capture(tmp_path_factory: pytest.TempPathFactory, image: str, execute):
+    def _capture(run: dict[str, Any]) -> Capture:
+        execution = execute(run)
+        pidstat_flags, pidstat_interval = pidstat_arguments(execution)
+        geometry = master_geometry(run)
+        clip = f"{CONTAINER_MASTERS}/{run['master']}"
+        output = f"{CONTAINER_OUT}/output.{run['container']}"
+        out_dir = tmp_path_factory.mktemp("capture")
+
+        result = run_in_image(
+            image,
+            ACCEPTANCE,
+            out_dir,
+            [
+                "--clip",
+                clip,
+                "--clip-size",
+                f"{geometry['width']}x{geometry['height']}",
+                "--pidstat-flags",
+                pidstat_flags,
+                "--pidstat-interval",
+                pidstat_interval,
+                "--muxer",
+                run["bitstream_muxer"],
+                "--",
+                *instrumentation_chain(execution, clip, output),
+            ],
+            # Sem a capability o `perf_event_open` é recusado, e a cadeia inteira
+            # sai não-zero antes de o encode começar.
+            "--cap-add=PERFMON",
+        )
+
+        return Capture(run=run, returncode=result.returncode, stderr=result.stderr, out_dir=out_dir)
+
+    return _capture
+
+
+@pytest.fixture(scope="session")
+def acceptance_runs(plan) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for block in plan["blocks"]:
+        if block["input_res"] != TIER or block["output_res"] != TIER:
+            continue
+        for run in block["runs"]:
+            if run["warmup"]:
+                continue
+            current = selected.get(run["encoder"])
+            if current is None or run["scenario_id"] < current["scenario_id"]:
+                selected[run["encoder"]] = run
+    return selected
+
+
+@pytest.fixture(scope="session", params=ENCODERS)
+def captured(request, acceptance_runs, capture, capture_dir) -> Capture:
+    encoder = request.param
+    result = capture(acceptance_runs[encoder])
+    if capture_dir is not None:
+        for artifact in CAPTURED:
+            if result.wrote(artifact):
+                shutil.copyfile(result.out_dir / artifact, capture_dir / f"{encoder}.{artifact}")
+    return result
+
+
+def output_path(captured: Capture) -> Path:
+    return captured.out_dir / f"output.{captured.run['container']}"
+
+
+class TestEncode:
+    def test_the_real_ffmpeg_accepted_the_argv_the_plan_generates(self, captured):
+        assert captured.returncode == 0, captured.stderr
+
+    def test_the_encode_wrote_the_output_the_argv_named(self, captured):
+        assert output_path(captured).stat().st_size > 0
+
+    def test_the_stats_line_counts_every_frame_of_the_clip(self, captured):
+        log = captured.artifact("ffmpeg.log")
+        frames = [int(match.group(1)) for match in FRAMES.finditer(log)]
+
+        assert frames, log
+        assert max(frames) == CLIP_SECONDS * CLIP_FPS
+
+
+class TestInstrumentation:
+    def test_the_gnu_time_wrote_json_with_the_format_string(self, captured):
+        # Sem o `--quiet` da invocação, o GNU time prefixa "Command exited with
+        # non-zero status" e o `time.json` de todo run falho deixa de ser JSON.
+        time = json.loads(captured.artifact("time.json"))
+
+        assert time["exit_status"] == 0
+        assert all(isinstance(value, int | float) for value in time.values())
+
+    def test_the_perf_echoes_back_every_event_the_spec_declares(self, captured):
+        # `perf stat` recusa um nome de evento que não conhece, então isto é o
+        # que verifica os nomes do `config/experiment.toml` sem PMU.
+        events = [
+            json.loads(line)["event"]
+            for line in captured.artifact("perf.json").splitlines()
+            if "counter-value" in line
+        ]
+
+        assert events == EXPERIMENT["instrumentation"]["pmu_events"]
+
+    def test_the_pidstat_sampled_the_encoder(self, captured):
+        # O cabeçalho vem do `-h`, e é dele que o parser tira a posição do `%CPU`.
+        lines = captured.artifact("pidstat.txt").splitlines()
+        header = next(line for line in lines if line.startswith("#"))
+        samples = [line for line in lines if line.endswith("ffmpeg")]
+
+        assert "%CPU" in header.split()
+        assert samples
+
+
+class TestBitstream:
+    def test_the_extraction_produced_a_digest(self, captured):
+        assert SHA256.match(captured.artifact("output.sha256").strip())
+
+    def test_the_digest_is_the_bitstream_and_not_the_container(self, captured):
+        digest = captured.artifact("output.sha256").strip()
+
+        assert digest != hashlib.sha256(output_path(captured).read_bytes()).hexdigest()
+
+
+def judgement_argv(traced: list[str], clip: str, distorted: str) -> list[str]:
+    argv = [FFMPEG, *traced]
+    inputs = iter((distorted, clip))
+    for index, argument in enumerate(argv):
+        if argument == "-i":
+            argv[index + 1] = next(inputs)
+        elif argument == "-filter_complex":
+            argv[index + 1] = LOG_PATH_OPTION.sub(
+                f"log_path={CONTAINER_OUT}/{VMAF_LOG}", argv[index + 1]
+            )
+    return argv
+
+
+@pytest.fixture(scope="session")
+def judged_by_the_shim(triaged, campaign, run_quality) -> Pass:
+    return run_quality(campaign[ARM], triaged.plan())
+
+
+@pytest.fixture(scope="session")
+def judge_in_image(
+    tmp_path_factory: pytest.TempPathFactory, image: str, judged_by_the_shim: Pass
+) -> Callable[..., Capture]:
+    traced = judged_by_the_shim.argv("ffmpeg")[0]
+    *_, master = (traced[index + 1] for index, each in enumerate(traced) if each == "-i")
+    clip = f"{CONTAINER_MASTERS}/{Path(master).name}"
+    width, height = SCALE.search(traced[traced.index("-filter_complex") + 1]).groups()
+
+    def _judge(encoder: str | None = None, video_delay: float | None = None) -> Capture:
+        out_dir = tmp_path_factory.mktemp("judge-capture")
+        arguments = ["--clip", clip, "--clip-size", f"{width}x{height}"]
+        distorted = clip
+        if encoder is not None:
+            distorted = f"{CONTAINER_OUT}/encoded.mkv"
+            arguments += ["--encoder", encoder, "--encoded", distorted]
+        elif video_delay is not None:
+            distorted = f"{CONTAINER_OUT}/video_only.mkv"
+            arguments += ["--video-delay", f"{video_delay:.6f}", "--video-only", distorted]
+        result = run_in_image(
+            image,
+            JUDGE_ACCEPTANCE,
+            out_dir,
+            [*arguments, "--", *judgement_argv(traced, clip, distorted)],
+        )
+        return Capture(returncode=result.returncode, stderr=result.stderr, out_dir=out_dir)
+
+    return _judge
+
+
+@pytest.fixture(scope="session")
+def judged_for_real(judge_in_image, capture_dir) -> Capture:
+    captured = judge_in_image()
+    if capture_dir is not None and captured.wrote(VMAF_LOG):
+        shutil.copyfile(captured.out_dir / VMAF_LOG, capture_dir / VMAF_LOG)
+    return captured
+
+
+@pytest.fixture(scope="session", params=ENCODERS)
+def judged_encode(request, judge_in_image) -> Capture:
+    return judge_in_image(request.param)
+
+
+@pytest.fixture(scope="session")
+def judged_late_video(judge_in_image) -> Capture:
+    return judge_in_image(video_delay=VIDEO_DELAY_S)
+
+
+def vmaf_log(captured: Capture) -> dict[str, Any]:
+    return json.loads(captured.artifact(VMAF_LOG))
+
+
+class TestJudge:
+    def test_the_real_ffmpeg_accepted_the_argv_the_judge_builds(self, judged_for_real):
+        assert judged_for_real.returncode == 0, judged_for_real.artifact("ffmpeg.log")
+
+    def test_the_log_has_one_entry_per_frame_of_the_clip(self, judged_for_real):
+        assert len(vmaf_log(judged_for_real)["frames"]) == CLIP_SECONDS * CLIP_FPS
+
+    def test_the_vmaf_of_the_clip_against_itself_is_close_to_100(self, judged_for_real):
+        log = vmaf_log(judged_for_real)
+        scores = [frame["metrics"]["vmaf"] for frame in log["frames"]]
+
+        assert all(isinstance(score, float) for score in scores)
+        assert log["pooled_metrics"]["vmaf"]["mean"] >= VMAF_FLOOR
+
+    def test_the_ssim_of_the_clip_against_itself_is_close_to_1(self, judged_for_real):
+        log = vmaf_log(judged_for_real)
+
+        assert log["pooled_metrics"]["float_ssim"]["mean"] >= SSIM_FLOOR
+
+    def test_the_fixture_readme_names_the_libvmaf_of_the_image(self, judged_for_real):
+        version = json.loads(judged_for_real.artifact("versions.json"))["libvmaf"]
+
+        assert f"`libvmaf` {version}" in FIXTURES_README.read_text(encoding="utf-8")
+
+
+class TestJudgeDecodesEveryEncoder:
+    def test_the_real_ffmpeg_judged_the_output_of_the_encoder(self, judged_encode):
+        assert judged_encode.returncode == 0, (
+            judged_encode.stderr + judged_encode.artifact("ffmpeg.log")[-2000:]
+        )
+
+    def test_the_log_has_one_entry_per_frame_of_the_clip(self, judged_encode):
+        assert len(vmaf_log(judged_encode)["frames"]) == CLIP_SECONDS * CLIP_FPS
+
+
+class TestJudgeAlignsAMasterWhoseVideoStartsLate:
+    def test_the_real_ffmpeg_accepted_the_argv_the_judge_builds(self, judged_late_video):
+        assert judged_late_video.returncode == 0, judged_late_video.artifact("ffmpeg.log")
+
+    def test_the_video_of_the_master_starts_after_zero(self, judged_late_video):
+        (start,) = STREAM_START.findall(judged_late_video.artifact("ffmpeg.log"))
+
+        assert float(start) == pytest.approx(VIDEO_DELAY_S, abs=0.001)
+
+    def test_the_log_has_one_entry_per_frame_of_the_clip(self, judged_late_video):
+        assert len(vmaf_log(judged_late_video)["frames"]) == CLIP_SECONDS * CLIP_FPS
+
+    def test_the_vmaf_of_the_video_against_its_master_is_close_to_100(self, judged_late_video):
+        assert vmaf_log(judged_late_video)["pooled_metrics"]["vmaf"]["mean"] >= VMAF_FLOOR

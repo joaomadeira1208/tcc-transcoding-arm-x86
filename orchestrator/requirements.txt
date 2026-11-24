@@ -1,0 +1,2 @@
+# Vazio de propósito: o papel é stdlib-only, e o que ele usa de fora do Python é
+# a AWS CLI, instalada pelo bootstrap da t3.micro e não por pip.

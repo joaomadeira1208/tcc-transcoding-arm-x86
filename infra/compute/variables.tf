@@ -1,0 +1,43 @@
+variable "state_bucket" {
+  description = "Bucket de state criado fora de banda; o mesmo nome que o `-backend-config` do init recebe."
+  type        = string
+}
+
+variable "ssh_allowed_cidr" {
+  description = "CIDR de onde a porta 22 do Orquestrador aceita conexão; em geral o IP público de quem acessa o Orquestrador, em /32."
+  type        = string
+
+  validation {
+    condition     = var.ssh_allowed_cidr != "0.0.0.0/0"
+    error_message = "A porta 22 do Orquestrador não pode ficar aberta ao mundo."
+  }
+}
+
+variable "budget_notification_email" {
+  description = "Email que recebe os dois alertas do orçamento de $150."
+  type        = string
+}
+
+variable "allowed_instance_types" {
+  description = "Tipos que o Orquestrador pode lançar; o teto de custo sob comprometimento. O c7i.4xlarge é o Juiz de [quality.judge]; o c7i.2xlarge, os dois braços da topologia."
+  type        = list(string)
+  default     = ["c7g.xlarge", "c7i.xlarge", "c7a.xlarge", "c7i.2xlarge", "c7i.4xlarge", "t3.micro"]
+}
+
+variable "orchestrator_ami_id" {
+  description = "Ubuntu 24.04 LTS amd64 do Orquestrador, resolvido do parâmetro público da Canonical em 2026-09-08."
+  type        = string
+  default     = "ami-025d99823a4caad37"
+}
+
+variable "encode_amd64_ami_id" {
+  description = "Ubuntu 24.04 LTS amd64 das efêmeras c7i.xlarge e c7a.xlarge, resolvido do parâmetro público da Canonical em 2026-09-08."
+  type        = string
+  default     = "ami-025d99823a4caad37"
+}
+
+variable "encode_arm64_ami_id" {
+  description = "Ubuntu 24.04 LTS arm64 da efêmera c7g.xlarge e da preparação dos Masters, resolvido do parâmetro público da Canonical em 2026-09-08."
+  type        = string
+  default     = "ami-0246d714afcc1d494"
+}

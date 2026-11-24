@@ -1,0 +1,23 @@
+Linux 6.8.0-117-generic (b0b470c9bfd9) 	09/13/26 	_aarch64_	(2 CPU)
+
+# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+20:49:57        0        31  163.37   23.76    0.00    0.00  187.13     1  89450.50      0.00 1327336  433344  21.61  ffmpeg
+
+# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+20:49:58        0        31  185.00    3.00    0.00    0.00  188.00     1   4206.00      0.00 1327336  450240  22.45  ffmpeg
+
+# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+20:49:59        0        31  183.00    2.00    0.00    0.00  185.00     1    115.00      0.00 1327336  450624  22.47  ffmpeg
+
+# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+20:50:00        0        31  188.00    2.00    0.00    0.00  190.00     1    604.00      0.00 1327336  453056  22.59  ffmpeg
+
+# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+20:50:01        0        31  189.00    1.00    0.00    0.00  190.00     1    346.00      0.00 1327096  454320  22.65  ffmpeg
+
+# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+20:50:02        0        31  189.00    2.00    0.00    0.00  191.00     1    528.00      0.00 1303500  440988  21.99  ffmpeg
+
+# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+20:50:03        0        31  178.00    2.00    0.00    0.00  180.00     0     20.00      0.00 1138512  337980  16.85  ffmpeg
+

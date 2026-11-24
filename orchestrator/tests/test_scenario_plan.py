@@ -1,0 +1,644 @@
+from __future__ import annotations
+
+import itertools
+import json
+import random
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from conftest import (
+    REAL_EXPERIMENT_TOML,
+    REAL_PILOT_TOML,
+    REPO_ROOT,
+    make_codec,
+    make_instance,
+    make_video,
+    real_config,
+    real_pilot_config,
+)
+from experiment_config import validate_config
+from scenario_plan import build_canonical_plan, build_instance_slices, serialize_plan
+
+# Cardinalidade da spec: 3 codecs x 9 pares x 2 vídeos x 3 instâncias.
+EXPECTED_COMBINATIONS = 54
+EXPECTED_BLOCKS = 162
+EXPECTED_RUNS = EXPECTED_BLOCKS * 6
+EXPECTED_REPLICATIONS = EXPECTED_BLOCKS * 5
+
+# Por fatia: as 54 combinações de uma arquitetura, x6 runs, x5 replicações.
+EXPECTED_SLICE_BLOCKS = EXPECTED_COMBINATIONS
+EXPECTED_SLICE_RUNS = EXPECTED_SLICE_BLOCKS * 6
+EXPECTED_SLICE_REPLICATIONS = EXPECTED_SLICE_BLOCKS * 5
+
+EXPECTED_INSTANCES = ("c7g", "c7i", "c7a")
+
+EXPECTED_PAIRS = {
+    ("2160p", "2160p"),
+    ("2160p", "1080p"),
+    ("2160p", "720p"),
+    ("2160p", "480p"),
+    ("1080p", "1080p"),
+    ("1080p", "720p"),
+    ("1080p", "480p"),
+    ("720p", "720p"),
+    ("720p", "480p"),
+}
+
+EXPECTED_PMU_EVENTS = [
+    "cycles",
+    "instructions",
+    "branch-instructions",
+    "branch-misses",
+    "task-clock",
+    "context-switches",
+    "cpu-migrations",
+    "page-faults",
+]
+
+# Cardinalidade do piloto: 3 codecs x 1 par x 2 vídeos x 3 instâncias,
+# com o mesmo bloco de 6.
+PILOT_COMBINATIONS = 6
+PILOT_BLOCKS = 18
+PILOT_RUNS = PILOT_BLOCKS * 6
+PILOT_REPLICATIONS = PILOT_BLOCKS * 5
+
+PILOT_SLICE_BLOCKS = PILOT_COMBINATIONS
+PILOT_SLICE_RUNS = PILOT_SLICE_BLOCKS * 6
+PILOT_SLICE_REPLICATIONS = PILOT_SLICE_BLOCKS * 5
+
+PILOT_PAIRS = {("1080p", "720p")}
+PILOT_CODECS = {"libx264", "libx265", "libsvtav1"}
+PILOT_VIDEOS = {"bbb", "tos"}
+
+SCENARIO_ID = re.compile(
+    r"^(?P<encoder>[a-z0-9]+)_(?P<input_res>[0-9]+p)_(?P<output_res>[0-9]+p)"
+    r"_(?P<video>[a-z0-9]+)_(?P<instance>[a-z0-9]+)_(?P<suffix>warmup|rep[1-9][0-9]*)$"
+)
+
+GENERATOR = REPO_ROOT / "orchestrator" / "generate_scenarios.py"
+
+# Transcrito, não importado: o teste do CLI é caixa-preta e o nome é contrato do
+# layout de prefixos do bucket.
+CANONICAL_FILENAME = "canonical.json"
+
+
+@pytest.fixture(scope="module")
+def plan() -> dict:
+    return build_canonical_plan(real_config())
+
+
+@pytest.fixture(scope="module")
+def slices(plan: dict) -> dict[str, dict]:
+    return build_instance_slices(plan)
+
+
+@pytest.fixture(scope="module")
+def pilot_plan() -> dict:
+    return build_canonical_plan(real_pilot_config())
+
+
+@pytest.fixture(scope="module")
+def pilot_slices(pilot_plan: dict) -> dict[str, dict]:
+    return build_instance_slices(pilot_plan)
+
+
+@pytest.fixture(
+    scope="module",
+    params=[real_config, real_pilot_config],
+    ids=["campaign", "pilot"],
+)
+def either_config(request):
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def either_plan(either_config) -> dict:
+    return build_canonical_plan(either_config())
+
+
+@pytest.fixture(scope="module")
+def either_slices(either_plan: dict) -> dict[str, dict]:
+    return build_instance_slices(either_plan)
+
+
+def all_runs(plan: dict) -> list[dict]:
+    return [run for block in plan["blocks"] for run in block["runs"]]
+
+
+def scenario_ids(plan: dict) -> set[str]:
+    return {run["scenario_id"] for run in all_runs(plan)}
+
+
+def block_key(block: dict) -> str:
+    return block["runs"][0]["scenario_id"]
+
+
+def blocks_of(plan: dict, instance: str) -> list[dict]:
+    return [block for block in plan["blocks"] if block["instance"] == instance]
+
+
+def combination_of(block: dict) -> tuple[str, str, str, str]:
+    return (block["encoder"], block["input_res"], block["output_res"], block["video"])
+
+
+def scenario_of(block: dict) -> tuple[str, str, str, str, str]:
+    return (
+        block["encoder"],
+        block["input_res"],
+        block["output_res"],
+        block["video"],
+        block["instance"],
+    )
+
+
+class TestCardinality:
+    def test_counts_of_the_spec(self, plan):
+        runs = all_runs(plan)
+
+        assert len(plan["blocks"]) == EXPECTED_BLOCKS
+        assert len(runs) == EXPECTED_RUNS
+        assert sum(1 for run in runs if run["warmup"] is False) == EXPECTED_REPLICATIONS
+
+    def test_no_duplicate_scenario_id(self, plan):
+        ids = [run["scenario_id"] for run in all_runs(plan)]
+
+        assert len(set(ids)) == len(ids)
+
+    def test_every_cell_of_the_matrix_appears_exactly_once(self, plan):
+        config = real_config()
+        expected = {
+            (codec.slug, pair.input_res, pair.output_res, video.slug, instance.id)
+            for codec in config.codecs
+            for pair in config.pairs
+            for video in config.videos
+            for instance in config.instances
+        }
+
+        declared = [scenario_of(block) for block in plan["blocks"]]
+
+        assert set(declared) == expected
+        assert len(declared) == len(expected)
+
+    def test_seed_echoed_from_the_toml(self, plan):
+        config = real_config()
+
+        assert plan["seed"] == config.seed
+        assert {run["seed"] for run in all_runs(plan)} == {config.seed}
+
+
+class TestMatrixOfTheSpec:
+    def test_blocks_cover_exactly_the_nine_pairs(self, plan):
+        assert {(b["input_res"], b["output_res"]) for b in plan["blocks"]} == EXPECTED_PAIRS
+
+    def test_each_pair_appears_in_every_codec_video_and_instance(self, plan):
+        counts: dict[tuple[str, str], int] = {}
+        for block in plan["blocks"]:
+            key = (block["input_res"], block["output_res"])
+            counts[key] = counts.get(key, 0) + 1
+
+        assert set(counts.values()) == {18}
+
+    def test_no_run_upscales(self, plan):
+        geometry = {video.slug: video.geometry for video in real_config().videos}
+
+        for block in plan["blocks"]:
+            source = geometry[block["video"]][block["input_res"]]
+            for run in block["runs"]:
+                assert run["output_width"] <= source.width
+                assert run["output_height"] <= source.height
+
+
+class TestPilotCardinality:
+    def test_expected_counts(self, pilot_plan):
+        runs = all_runs(pilot_plan)
+
+        assert len(pilot_plan["blocks"]) == PILOT_BLOCKS
+        assert len(runs) == PILOT_RUNS
+        assert sum(1 for run in runs if run["warmup"] is False) == PILOT_REPLICATIONS
+
+    def test_counts_of_each_slice(self, pilot_slices):
+        for instance, plan_slice in pilot_slices.items():
+            runs = all_runs(plan_slice)
+
+            assert len(plan_slice["blocks"]) == PILOT_SLICE_BLOCKS, instance
+            assert len(runs) == PILOT_SLICE_RUNS, instance
+            assert sum(1 for run in runs if run["warmup"] is False) == PILOT_SLICE_REPLICATIONS
+
+    def test_no_duplicate_scenario_id(self, pilot_plan):
+        ids = [run["scenario_id"] for run in all_runs(pilot_plan)]
+
+        assert len(set(ids)) == len(ids)
+
+    def test_blocks_cover_exactly_the_axes(self, pilot_plan):
+        blocks = pilot_plan["blocks"]
+
+        assert {(b["input_res"], b["output_res"]) for b in blocks} == PILOT_PAIRS
+        assert {b["encoder"] for b in blocks} == PILOT_CODECS
+        assert {b["video"] for b in blocks} == PILOT_VIDEOS
+        assert {b["instance"] for b in blocks} == set(EXPECTED_INSTANCES)
+
+    def test_every_cell_of_the_matrix_appears_exactly_once(self, pilot_plan):
+        expected = {
+            (codec, input_res, output_res, video, instance)
+            for codec in PILOT_CODECS
+            for input_res, output_res in PILOT_PAIRS
+            for video in PILOT_VIDEOS
+            for instance in EXPECTED_INSTANCES
+        }
+
+        declared = [scenario_of(block) for block in pilot_plan["blocks"]]
+
+        assert set(declared) == expected
+        assert len(declared) == len(expected)
+
+    def test_no_run_upscales(self, pilot_plan):
+        geometry = {video.slug: video.geometry for video in real_pilot_config().videos}
+
+        for block in pilot_plan["blocks"]:
+            source = geometry[block["video"]][block["input_res"]]
+            for run in block["runs"]:
+                assert run["output_width"] <= source.width
+                assert run["output_height"] <= source.height
+
+
+class TestBlockStructure:
+    def test_six_runs_per_block_with_the_warmup_first(self, plan):
+        for block in plan["blocks"]:
+            flags = [run["warmup"] for run in block["runs"]]
+
+            assert flags == [True, False, False, False, False, False]
+
+    def test_warmup_is_a_real_json_boolean(self, plan):
+        reloaded = json.loads(serialize_plan(plan))
+
+        for run in all_runs(reloaded):
+            assert type(run["warmup"]) is bool
+
+    def test_block_carries_the_scenario_fields_and_its_runs(self, plan):
+        for block in plan["blocks"]:
+            assert set(block) == {
+                "codec",
+                "encoder",
+                "input_res",
+                "output_res",
+                "video",
+                "instance",
+                "runs",
+            }
+
+
+class TestScenarioId:
+    def test_format_of_every_scenario_id(self, plan):
+        for block in plan["blocks"]:
+            for run in block["runs"]:
+                match = SCENARIO_ID.match(run["scenario_id"])
+
+                assert match is not None, run["scenario_id"]
+                assert match.group("encoder", "input_res", "output_res", "video", "instance") == (
+                    scenario_of(block)
+                )
+
+    def test_suffixes_of_a_block(self, plan):
+        for block in plan["blocks"]:
+            suffixes = [run["scenario_id"].rsplit("_", 1)[1] for run in block["runs"]]
+
+            assert suffixes == ["warmup", "rep1", "rep2", "rep3", "rep4", "rep5"]
+
+    def test_the_discarded_run_is_never_rep0(self, plan):
+        assert not any(run["scenario_id"].endswith("_rep0") for run in all_runs(plan))
+
+    def test_a_known_scenario_id_matches_the_canonical_example(self, plan):
+        assert "libx264_2160p_1080p_bbb_c7g_rep1" in {run["scenario_id"] for run in all_runs(plan)}
+
+
+class TestRunParameters:
+    def test_a_run_carries_exactly_the_fields_of_the_contract(self, plan):
+        for run in all_runs(plan):
+            assert set(run) == {
+                "scenario_id",
+                "warmup",
+                "seed",
+                "codec",
+                "encoder",
+                "input_res",
+                "output_res",
+                "video",
+                "instance",
+                "master",
+                "output_width",
+                "output_height",
+                "preset",
+                "crf",
+                "encoder_args",
+                "threads",
+                "gop_size",
+                "pix_fmt",
+                "strip_audio",
+                "container",
+                "scale_flags",
+                "bitstream_muxer",
+                "pmu_events",
+                "perf_event_spec",
+                "pmu_hardware_events",
+                "pmu_metrics",
+            }
+
+    def test_a_known_run_repeats_the_identity_of_its_block(self, plan):
+        run = one_run(plan, "libx265_2160p_720p_tos_c7i_rep3")
+
+        assert (run["codec"], run["encoder"]) == ("h265", "libx265")
+        assert (run["input_res"], run["output_res"]) == ("2160p", "720p")
+        assert (run["video"], run["instance"]) == ("tos", "c7i")
+        assert run["warmup"] is False
+
+    def test_every_run_carries_the_output_geometry_of_its_tier(self, plan):
+        geometry = {video.slug: video.geometry for video in real_config().videos}
+
+        for block in plan["blocks"]:
+            target = geometry[block["video"]][block["output_res"]]
+            for run in block["runs"]:
+                assert (run["output_width"], run["output_height"]) == (target.width, target.height)
+
+    def test_every_run_carries_the_encode_record_of_its_codec(self, plan):
+        codecs = {c.slug: c for c in real_config().codecs}
+
+        for run in all_runs(plan):
+            codec = codecs[run["encoder"]]
+
+            assert (run["codec"], run["preset"], run["crf"]) == (
+                codec.codec,
+                codec.preset,
+                codec.crf,
+            )
+            assert run["encoder_args"] == list(codec.encoder_args)
+            assert run["bitstream_muxer"] == codec.bitstream_muxer
+
+    def test_every_run_carries_the_fixed_encode_params(self, plan):
+        encode = real_config().encode
+
+        for run in all_runs(plan):
+            assert run["threads"] == encode.threads
+            assert run["gop_size"] == encode.gop_size
+            assert run["pix_fmt"] == encode.pix_fmt
+            assert run["strip_audio"] == encode.strip_audio
+            assert run["container"] == encode.container
+            assert run["scale_flags"] == encode.scale_flags
+
+    def test_every_run_carries_the_pmu_events_of_the_spec(self, plan):
+        # Em **cada** run: o bash recebe um por vez e não olha para cima.
+        events = list(real_config().instrumentation.pmu_events)
+
+        for run in all_runs(plan):
+            assert run["pmu_events"] == events
+
+    def test_a_known_run_carries_the_bitstream_muxer_and_the_pmu_events(self, plan):
+        # O muxer que menos se parece com o encoder: `libsvtav1` → `obu` não sai
+        # de manipulação de string nenhuma.
+        run = one_run(plan, "libsvtav1_2160p_480p_bbb_c7a_rep2")
+
+        assert run["bitstream_muxer"] == "obu"
+        assert run["pmu_events"] == EXPECTED_PMU_EVENTS
+
+    def test_every_run_names_the_master_of_its_input_res(self, plan):
+        for block in plan["blocks"]:
+            expected = f"{block['video']}_{block['input_res']}.mkv"
+            for run in block["runs"]:
+                assert run["master"] == expected
+                assert "/" not in run["master"]
+
+
+class TestDeterminism:
+    def test_generating_twice_produces_identical_bytes(self, either_config):
+        first = serialize_plan(build_canonical_plan(either_config()))
+        second = serialize_plan(build_canonical_plan(either_config()))
+
+        assert first == second
+
+    def test_the_plan_does_not_depend_on_the_global_random_state(self):
+        random.seed(1)
+        first = serialize_plan(build_canonical_plan(real_config()))
+        random.seed(2)
+        for _ in range(10):
+            random.random()
+        second = serialize_plan(build_canonical_plan(real_config()))
+
+        assert first == second
+
+    def test_the_plan_does_not_consume_the_global_random_stream(self):
+        random.seed(7)
+        expected = [random.random() for _ in range(3)]
+
+        random.seed(7)
+        build_canonical_plan(real_config())
+
+        assert [random.random() for _ in range(3)] == expected
+
+    def test_the_plan_carries_no_timestamp_or_environment_field(self, plan):
+        assert set(plan) == {"schema_version", "seed", "blocks"}
+        assert "generated_at" not in serialize_plan(plan)
+
+    def test_serialization_ends_with_a_newline(self, plan):
+        assert serialize_plan(plan).endswith("}\n")
+
+    def test_schema_version_is_a_string(self, plan):
+        # Literal de texto, para que o bash a ecoe sem remarshalling.
+        assert plan["schema_version"] == "1"
+
+
+class TestSeededShuffle:
+    # A contagem é transcrita, e não derivada do plano sob teste: um gerador que
+    # emitisse um terço dos blocos satisfaria `len(blocks) // 3`.
+    @pytest.mark.parametrize(
+        ("config", "combinations"),
+        [
+            pytest.param(real_config, EXPECTED_COMBINATIONS, id="campaign"),
+            pytest.param(real_pilot_config, PILOT_COMBINATIONS, id="pilot"),
+        ],
+    )
+    def test_the_three_architectures_see_the_same_order_of_combinations(self, config, combinations):
+        plan = build_canonical_plan(config())
+        orders = {
+            instance: [combination_of(b) for b in blocks_of(plan, instance)]
+            for instance in EXPECTED_INSTANCES
+        }
+
+        assert len(set(map(tuple, orders.values()))) == 1
+        assert len(orders["c7g"]) == combinations
+
+    def test_the_canonical_is_arch_major_with_contiguous_slices(self, either_plan):
+        instances = [block["instance"] for block in either_plan["blocks"]]
+        runs = [instance for instance, _ in itertools.groupby(instances)]
+
+        assert runs == ["c7g", "c7i", "c7a"]
+
+    def test_the_order_is_not_the_declaration_order_of_the_toml(self, plan):
+        config = real_config()
+        declared = [
+            (codec.slug, pair.input_res, pair.output_res, video.slug)
+            for codec in config.codecs
+            for pair in config.pairs
+            for video in config.videos
+        ]
+
+        assert [combination_of(b) for b in blocks_of(plan, "c7g")] != declared
+
+    def test_the_order_is_the_shuffle_of_the_seed_of_the_toml(self, make_raw_config):
+        # Golden inline, porque congelar a ordem **é** o requisito: o que se
+        # pega é `random.shuffle` mudando entre versões de Python, ou alguém
+        # reordenando o produto cartesiano sem perceber.
+        raw = make_raw_config(
+            experiment={"seed": 20260808, "replications": 5, "warmup_runs": 1},
+            codec=[make_codec(slug="libx264"), make_codec(slug="libx265", codec="h265")],
+            video=[make_video(slug="bbb"), make_video(slug="tos")],
+            instance=[
+                make_instance(id="c7g", instance_type="c7g.xlarge", arch="arm64"),
+                make_instance(id="c7i", instance_type="c7i.xlarge", arch="x86_64"),
+            ],
+        )
+
+        blocks = build_canonical_plan(validate_config(raw))["blocks"]
+
+        assert [block["runs"][0]["scenario_id"] for block in blocks] == [
+            "libx264_1080p_720p_tos_c7g_warmup",
+            "libx265_1080p_1080p_tos_c7g_warmup",
+            "libx265_1080p_720p_tos_c7g_warmup",
+            "libx264_1080p_1080p_tos_c7g_warmup",
+            "libx265_1080p_1080p_bbb_c7g_warmup",
+            "libx264_1080p_720p_bbb_c7g_warmup",
+            "libx265_1080p_720p_bbb_c7g_warmup",
+            "libx264_1080p_1080p_bbb_c7g_warmup",
+            "libx264_1080p_720p_tos_c7i_warmup",
+            "libx265_1080p_1080p_tos_c7i_warmup",
+            "libx265_1080p_720p_tos_c7i_warmup",
+            "libx264_1080p_1080p_tos_c7i_warmup",
+            "libx265_1080p_1080p_bbb_c7i_warmup",
+            "libx264_1080p_720p_bbb_c7i_warmup",
+            "libx265_1080p_720p_bbb_c7i_warmup",
+            "libx264_1080p_1080p_bbb_c7i_warmup",
+        ]
+
+    def test_a_different_seed_produces_a_different_order(self, make_raw_config):
+        def order(seed: int) -> list[tuple[str, str, str, str]]:
+            raw = make_raw_config(
+                experiment={"seed": seed, "replications": 5, "warmup_runs": 1},
+                codec=[make_codec(slug="libx264"), make_codec(slug="libx265", codec="h265")],
+                video=[make_video(slug="bbb"), make_video(slug="tos")],
+            )
+            return [combination_of(b) for b in build_canonical_plan(validate_config(raw))["blocks"]]
+
+        assert order(1) != order(2)
+        assert sorted(order(1)) == sorted(order(2))
+
+
+class TestSlices:
+    def test_one_slice_per_instance_keyed_by_the_short_id(self, either_slices):
+        assert set(either_slices) == set(EXPECTED_INSTANCES)
+
+    def test_counts_of_each_slice(self, slices):
+        for instance, plan_slice in slices.items():
+            runs = all_runs(plan_slice)
+
+            assert len(plan_slice["blocks"]) == EXPECTED_SLICE_BLOCKS, instance
+            assert len(runs) == EXPECTED_SLICE_RUNS, instance
+            assert sum(1 for run in runs if run["warmup"] is False) == EXPECTED_SLICE_REPLICATIONS
+
+    def test_each_slice_carries_only_blocks_of_its_architecture(self, either_slices):
+        # A Instância roda **todo** bloco do arquivo que recebeu: um bloco alheio
+        # não é filtrado por ninguém, é executado.
+        for instance, plan_slice in either_slices.items():
+            assert {block["instance"] for block in plan_slice["blocks"]} == {instance}
+
+    def test_the_union_of_the_slices_is_the_canonical(self, either_plan, either_slices):
+        united = [block for plan_slice in either_slices.values() for block in plan_slice["blocks"]]
+
+        assert sorted(united, key=block_key) == sorted(either_plan["blocks"], key=block_key)
+
+    def test_the_slices_are_pairwise_disjoint(self, either_slices):
+        for first, second in itertools.combinations(either_slices.values(), 2):
+            assert scenario_ids(first) & scenario_ids(second) == set()
+
+    def test_the_relative_order_of_the_canonical_is_preserved(self, either_plan, either_slices):
+        position = {block_key(block): index for index, block in enumerate(either_plan["blocks"])}
+
+        for instance, plan_slice in either_slices.items():
+            positions = [position[block_key(block)] for block in plan_slice["blocks"]]
+
+            assert positions == sorted(positions), instance
+
+    def test_a_slice_carries_the_top_shape_of_the_canonical(self, either_plan, either_slices):
+        for plan_slice in either_slices.values():
+            assert set(plan_slice) == set(either_plan)
+            assert plan_slice["schema_version"] == either_plan["schema_version"]
+            assert plan_slice["seed"] == either_plan["seed"]
+
+    def test_the_projection_leaves_the_canonical_untouched(self, plan):
+        before = serialize_plan(plan)
+
+        build_instance_slices(plan)
+
+        assert serialize_plan(plan) == before
+
+    def test_slicing_twice_produces_identical_bytes(self, either_config):
+        first = build_instance_slices(build_canonical_plan(either_config()))
+        second = build_instance_slices(build_canonical_plan(either_config()))
+
+        assert [serialize_plan(s) for s in first.values()] == [
+            serialize_plan(s) for s in second.values()
+        ]
+
+
+class TestCli:
+    @pytest.mark.parametrize(
+        ("config", "blocks", "slice_blocks"),
+        [
+            pytest.param(
+                REAL_EXPERIMENT_TOML, EXPECTED_BLOCKS, EXPECTED_SLICE_BLOCKS, id="campaign"
+            ),
+            pytest.param(REAL_PILOT_TOML, PILOT_BLOCKS, PILOT_SLICE_BLOCKS, id="pilot"),
+        ],
+    )
+    def test_writes_the_canonical_and_one_slice_per_architecture(
+        self, tmp_path, config, blocks, slice_blocks
+    ):
+        first = generate_into(config, tmp_path / "first")
+        second = generate_into(config, tmp_path / "second")
+        expected = {CANONICAL_FILENAME, *(f"{instance}.json" for instance in EXPECTED_INSTANCES)}
+
+        assert {path.name for path in first.iterdir()} == expected
+
+        for name in expected:
+            written = (first / name).read_bytes()
+
+            assert written == (second / name).read_bytes(), name
+
+        canonical = json.loads((first / CANONICAL_FILENAME).read_text(encoding="utf-8"))
+
+        assert len(canonical["blocks"]) == blocks
+
+        for instance in EXPECTED_INSTANCES:
+            plan_slice = json.loads((first / f"{instance}.json").read_text(encoding="utf-8"))
+
+            assert len(plan_slice["blocks"]) == slice_blocks, instance
+            assert {block["instance"] for block in plan_slice["blocks"]} == {instance}
+
+
+def generate_into(config: Path, out: Path) -> Path:
+    result = subprocess.run(
+        [sys.executable, str(GENERATOR), "--config", str(config), "--out", str(out)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    return out
+
+
+def one_run(plan: dict, scenario_id: str) -> dict:
+    matches = [run for run in all_runs(plan) if run["scenario_id"] == scenario_id]
+
+    assert len(matches) == 1, scenario_id
+    return matches[0]

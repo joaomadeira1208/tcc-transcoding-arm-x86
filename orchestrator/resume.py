@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""CLI da retomada: decide o que falta e escreve as fatias reduzidas."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+from experiment_config import ConfigError
+from external import ExternalCommandError, s3_sync_run_metas
+from generate_scenarios import SLICE_FILENAME, load_config, write_plans
+from meta_check import MetaError
+from resume_plan import reduced_slices, render_report, resume
+from run_tree import read_runs
+from scenario_plan import build_canonical_plan
+
+EXIT_OK = 0
+EXIT_INVALID_META = 1
+EXIT_UNREADABLE = 2
+
+COMMIT_SHA_DIGITS = 40
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def excluded_commit(value: str) -> str:
+    """Um `--exclude-commit` abreviado não casaria com `commit` nenhum do bucket, e
+    a retomada sairia zero declarando completos exatamente os blocos que deveria
+    invalidar — a falha que este argumento existe para evitar.
+    """
+    if len(value) != COMMIT_SHA_DIGITS or set(value) - _HEX_DIGITS:
+        raise argparse.ArgumentTypeError(
+            f"esperava os {COMMIT_SHA_DIGITS} dígitos hexadecimais minúsculos que o "
+            f"meta.json registra (git rev-parse <ref>), veio {value!r}"
+        )
+    return value
+
+
+def fresh_out_dir(value: str) -> Path:
+    """O diretório é a interface com o `run --slices`, que sobe **toda** arquitetura
+    presente nele. Reusar o `--out` da retomada anterior deixaria lá a fatia de
+    uma arquitetura que desta vez saiu completa, e o `run` seguinte refaria os 54
+    blocos dela — com o relatório ao lado dizendo que não há o que retomar.
+    """
+    out = Path(value)
+    existing = sorted(path.name for path in out.glob(SLICE_FILENAME.format(instance="*")))
+    if existing:
+        raise argparse.ArgumentTypeError(
+            f"{out} já contém {', '.join(existing)}: cada retomada escreve num "
+            f"diretório novo, porque o 'run --slices' sobe toda fatia que estiver lá"
+        )
+    return out
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="resume.py",
+        description=(
+            "Decide o que falta de uma campanha interrompida e escreve as fatias "
+            "reduzidas que o 'orchestrator.py run --slices' executa."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        type=Path,
+        help="caminho do TOML que gerou o plano da campanha",
+    )
+    parser.add_argument(
+        "--bucket",
+        required=True,
+        help="nome do bucket da campanha, de onde os meta.json são baixados",
+    )
+    parser.add_argument(
+        "--out",
+        required=True,
+        type=fresh_out_dir,
+        help=(
+            "diretório onde as fatias reduzidas são escritas (criado se não "
+            "existir; recusado se já contiver fatias)"
+        ),
+    )
+    parser.add_argument(
+        "--exclude-commit",
+        action="append",
+        default=[],
+        type=excluded_commit,
+        metavar="SHA",
+        help=(
+            "invalida todo bloco com Replicação vencedora neste commit; "
+            "repetível (correção que tocou o caminho de medição)"
+        ),
+    )
+    args = parser.parse_args()
+
+    try:
+        plan = build_canonical_plan(load_config(args.config))
+    except (OSError, tomllib.TOMLDecodeError, ConfigError) as error:
+        print(f"{args.config}: {error}", file=sys.stderr)
+        return EXIT_UNREADABLE
+
+    with tempfile.TemporaryDirectory(prefix="resume-") as workspace:
+        runs = Path(workspace)
+        try:
+            s3_sync_run_metas(args.bucket, runs)
+        except ExternalCommandError as error:
+            print(error, file=sys.stderr)
+            return EXIT_UNREADABLE
+
+        try:
+            metas, _, warnings = read_runs(runs)
+        except MetaError as error:
+            print(error, file=sys.stderr)
+            return EXIT_INVALID_META
+        except OSError as error:
+            print(f"{error.filename}: {error.strerror}", file=sys.stderr)
+            return EXIT_UNREADABLE
+
+    for warning in warnings:
+        print(warning, file=sys.stderr)
+
+    resumes = resume(plan, metas, excluded_commits=args.exclude_commit)
+    slices = reduced_slices(plan, resumes)
+    artifacts = {
+        args.out / SLICE_FILENAME.format(instance=instance): reduced
+        for instance, reduced in slices.items()
+    }
+
+    try:
+        write_plans(artifacts, args.out)
+    except OSError as error:
+        print(f"{args.out}: {error.strerror}", file=sys.stderr)
+        return EXIT_UNREADABLE
+
+    print(render_report(resumes))
+    for path in artifacts:
+        print(f"fatia reduzida: {path}")
+    if not artifacts:
+        print("nada pendente: não há o que retomar")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

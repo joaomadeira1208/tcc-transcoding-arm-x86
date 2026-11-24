@@ -1,0 +1,20 @@
+# O `pydantic` não é importado por nada daqui. Ele está na lista porque o smoke
+# valida o `meta.json` que o bash acabou de escrever invocando
+# `analysis/validate_meta.py` como caixa-preta, com o mesmo interpretador — e é
+# o modelo estrito daquele papel que dá a resposta.
+#
+# O `pyarrow` está pela mesma razão, um papel adiante: o smoke consolida a árvore
+# que o laço produziu invocando `analysis/consolidate.py`, e ler o Parquet que
+# saiu de lá é como se verifica que os parsers atravessaram o texto das
+# ferramentas.
+#
+# O `pandas` é o mesmo motivo outra vez: o item 5 da checklist é verificado
+# invocando `analysis/gate.py --quality` sobre a tabela de grupos que o
+# `quality.py` escreveu, e o `gate.py` lê os Parquets por ele.
+#
+# Os linters não entram aqui: o pre-commit gerencia os próprios ambientes.
+
+pytest==9.1.1
+pydantic==2.13.5
+pyarrow==25.0.1
+pandas==3.0.5

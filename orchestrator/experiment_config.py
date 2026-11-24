@@ -1,0 +1,589 @@
+"""Núcleo de validação da spec do Experimento — função pura, sem I/O."""
+
+from __future__ import annotations
+
+from collections.abc import Hashable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+_TOP_LEVEL_KEYS = frozenset(
+    {"experiment", "encode", "instrumentation", "quality", "codec", "pair", "video", "instance"}
+)
+
+
+SCENARIO_ID_SEPARATOR = "_"
+
+_CPU_OPTIONS_KEYS = ("core_count", "threads_per_core")
+
+SHA256_DIGITS = 64
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+class ConfigError(Exception):
+    """Spec inválida."""
+
+
+@dataclass(frozen=True)
+class Geometry:
+    width: int
+    height: int
+
+    def __str__(self) -> str:
+        return f"{self.width}x{self.height}"
+
+    def fits_within(self, other: Geometry) -> bool:
+        return self.width <= other.width and self.height <= other.height
+
+
+@dataclass(frozen=True)
+class CodecRecord:
+    slug: str
+    codec: str
+    encoder: str
+    preset: str
+    crf: int
+    encoder_args: tuple[str, ...]
+    bitstream_muxer: str
+
+
+@dataclass(frozen=True)
+class PairRecord:
+    input_res: str
+    output_res: str
+
+    def __str__(self) -> str:
+        return f"{self.input_res} -> {self.output_res}"
+
+
+@dataclass(frozen=True)
+class SourceRecord:
+    url: str
+    file: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class VideoRecord:
+    slug: str
+    title: str
+    frame_rate: str
+    frames: int
+    geometry: Mapping[str, Geometry]
+    source: SourceRecord
+
+
+@dataclass(frozen=True)
+class CpuOptions:
+    core_count: int
+    threads_per_core: int
+
+    @property
+    def vcpus(self) -> int:
+        return self.core_count * self.threads_per_core
+
+
+@dataclass(frozen=True)
+class InstanceRecord:
+    id: str
+    instance_type: str
+    arch: str
+    cpu_options: CpuOptions | None
+
+
+@dataclass(frozen=True)
+class FixedEncodeParams:
+    threads: int
+    gop_size: int
+    pix_fmt: str
+    strip_audio: bool
+    container: str
+    scale_flags: str
+
+
+@dataclass(frozen=True)
+class JudgeRecord:
+    instance_type: str
+    arch: str
+
+
+@dataclass(frozen=True)
+class QualityParams:
+    vmaf_model: str
+    vmaf_delta_max: float
+    ssim_delta_max: float
+    judge: JudgeRecord
+
+
+@dataclass(frozen=True)
+class MetricRecord:
+    name: str
+    numerator: str
+    denominator: str
+    max_ratio: float
+
+    @property
+    def events(self) -> tuple[str, str]:
+        return (self.numerator, self.denominator)
+
+    def exceeds(self, numerator: float, denominator: float) -> bool:
+        return numerator > self.max_ratio * denominator
+
+
+@dataclass(frozen=True)
+class Instrumentation:
+    pmu_events: tuple[str, ...]
+    metrics: tuple[MetricRecord, ...]
+
+    @property
+    def event_spec(self) -> str:
+        """Os membros saem na ordem de `pmu_events` e o grupo ocupa a posição do
+        primeiro deles, de modo que o `-e` achatado **seja** a lista declarada.
+        Ordenar o grupo pela declaração da métrica reordenaria os contadores do
+        `perf.json`, e quem lê a saída por posição passaria a ler outro evento.
+        """
+        grouped = {event: metric for metric in self.metrics for event in metric.events}
+        parts: list[str] = []
+        emitted: set[str] = set()
+        for event in self.pmu_events:
+            if event in emitted:
+                continue
+            metric = grouped.get(event)
+            if metric is None:
+                parts.append(event)
+                emitted.add(event)
+                continue
+            members = [name for name in self.pmu_events if name in metric.events]
+            parts.append("{" + ",".join(members) + "}")
+            emitted.update(members)
+        return ",".join(parts)
+
+    @property
+    def hardware_events(self) -> tuple[str, ...]:
+        grouped = {event for metric in self.metrics for event in metric.events}
+        return tuple(event for event in self.pmu_events if event in grouped)
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    seed: int
+    replications: int
+    warmup_runs: int
+    encode: FixedEncodeParams
+    instrumentation: Instrumentation
+    quality: QualityParams
+    codecs: tuple[CodecRecord, ...]
+    pairs: tuple[PairRecord, ...]
+    videos: tuple[VideoRecord, ...]
+    instances: tuple[InstanceRecord, ...]
+
+
+def validate_config(raw: Mapping[str, Any]) -> ExperimentConfig:
+    _reject_unknown(raw, _TOP_LEVEL_KEYS, "top level")
+
+    experiment = _table(raw, "experiment")
+    _reject_unknown(experiment, {"seed", "replications", "warmup_runs"}, "experiment")
+
+    config = ExperimentConfig(
+        seed=_int(experiment, "seed", "experiment", minimum=0),
+        replications=_int(experiment, "replications", "experiment", minimum=1),
+        warmup_runs=_int(experiment, "warmup_runs", "experiment", minimum=0),
+        encode=_encode(_table(raw, "encode")),
+        instrumentation=_instrumentation(_table(raw, "instrumentation")),
+        quality=_quality(_table(raw, "quality")),
+        codecs=tuple(_codec(r, i) for i, r in enumerate(_records(raw, "codec"))),
+        pairs=tuple(_pair(r, i) for i, r in enumerate(_records(raw, "pair"))),
+        videos=tuple(_video(r, i) for i, r in enumerate(_records(raw, "video"))),
+        instances=tuple(_instance(r, i) for i, r in enumerate(_records(raw, "instance"))),
+    )
+
+    _reject_duplicates((c.slug for c in config.codecs), "codec", "slug")
+    _reject_duplicates((v.slug for v in config.videos), "video", "slug")
+    _reject_duplicates((i.id for i in config.instances), "instance", "id")
+    # Chavear pelo registro, e não pelo texto do `__str__`: senão uma mudança
+    # cosmética na mensagem de erro vira mudança de semântica.
+    _reject_duplicates(config.pairs, "pair", "pair")
+
+    _reject_ambiguous_warmup(config.warmup_runs)
+    _reject_missing_geometry(config.pairs, config.videos)
+    _reject_upscale(config.pairs, config.videos)
+
+    return config
+
+
+def _encode(record: Mapping[str, Any]) -> FixedEncodeParams:
+    where = "encode"
+    _reject_unknown(
+        record,
+        {"threads", "gop_size", "pix_fmt", "strip_audio", "container", "scale_flags"},
+        where,
+    )
+    return FixedEncodeParams(
+        threads=_int(record, "threads", where, minimum=0),
+        gop_size=_int(record, "gop_size", where, minimum=1),
+        pix_fmt=_str(record, "pix_fmt", where),
+        strip_audio=_bool(record, "strip_audio", where),
+        container=_str(record, "container", where),
+        scale_flags=_str(record, "scale_flags", where),
+    )
+
+
+def _quality(record: Mapping[str, Any]) -> QualityParams:
+    where = "quality"
+    _reject_unknown(record, {"vmaf_model", "vmaf_delta_max", "ssim_delta_max", "judge"}, where)
+    return QualityParams(
+        vmaf_model=_str(record, "vmaf_model", where),
+        vmaf_delta_max=_positive_number(record, "vmaf_delta_max", where),
+        ssim_delta_max=_positive_number(record, "ssim_delta_max", where),
+        judge=_judge(record, where),
+    )
+
+
+def _judge(record: Mapping[str, Any], where: str) -> JudgeRecord:
+    table = _require(record, "judge", where)
+    judge_where = f"{where}: judge"
+    if not isinstance(table, Mapping):
+        raise ConfigError(f"{judge_where} must be a table with 'instance_type' and 'arch'")
+
+    _reject_unknown(table, {"instance_type", "arch"}, judge_where)
+    return JudgeRecord(
+        instance_type=_str(table, "instance_type", judge_where),
+        arch=_str(table, "arch", judge_where),
+    )
+
+
+def _instrumentation(record: Mapping[str, Any]) -> Instrumentation:
+    where = "instrumentation"
+    _reject_unknown(record, {"pmu_events", "metric"}, where)
+
+    events = _str_list(record, "pmu_events", where)
+    # Um `perf stat` sem `-e` roda, coleta o conjunto default e devolve um JSON
+    # plausível, sem os eventos que `[instrumentation]` declara.
+    if not events:
+        raise ConfigError(f"{where}: 'pmu_events' must declare at least one event")
+    # Evento repetido não estoura no `perf`: emite duas entradas com o mesmo nome,
+    # e quem lê o JSON por nome fica com uma delas, escolhida por acaso.
+    _reject_duplicates(events, "pmu_events", "event")
+
+    metrics = tuple(_metric(r, i) for i, r in enumerate(_records(record, "metric")))
+    _reject_duplicates((metric.name for metric in metrics), f"{where}: metric", "name")
+    _reject_ungrouped_events(metrics, events)
+    _reject_shared_events(metrics)
+
+    return Instrumentation(pmu_events=events, metrics=metrics)
+
+
+def _metric(record: Mapping[str, Any], index: int) -> MetricRecord:
+    where = f"instrumentation: {_where('metric', index, record.get('name'))}"
+    _reject_unknown(record, {"name", "numerator", "denominator", "max_ratio"}, where)
+
+    metric = MetricRecord(
+        name=_str(record, "name", where),
+        numerator=_str(record, "numerator", where),
+        denominator=_str(record, "denominator", where),
+        max_ratio=_positive_number(record, "max_ratio", where),
+    )
+    # Um grupo de um membro só não é grupo: o `perf` o escalona sozinho e a razão
+    # volta a misturar duas janelas de execução.
+    if metric.numerator == metric.denominator:
+        raise ConfigError(
+            f"{where}: 'numerator' and 'denominator' must be different events, "
+            f"both are '{metric.numerator}'"
+        )
+    return metric
+
+
+def _reject_ungrouped_events(metrics: Sequence[MetricRecord], events: Sequence[str]) -> None:
+    declared = set(events)
+    for index, metric in enumerate(metrics):
+        for field, event in (("numerator", metric.numerator), ("denominator", metric.denominator)):
+            if event not in declared:
+                raise ConfigError(
+                    f"instrumentation: {_where('metric', index, metric.name)}: '{field}' "
+                    f"names '{event}', which is not declared in 'pmu_events'"
+                )
+
+
+def _reject_shared_events(metrics: Sequence[MetricRecord]) -> None:
+    """Nenhum evento em dois grupos: o `perf` abriria dois contadores para ele."""
+    owner: dict[str, str] = {}
+    for index, metric in enumerate(metrics):
+        for event in metric.events:
+            if event in owner:
+                raise ConfigError(
+                    f"instrumentation: {_where('metric', index, metric.name)}: '{event}' "
+                    f"is already grouped by metric '{owner[event]}'"
+                )
+            owner[event] = metric.name
+
+
+def _codec(record: Mapping[str, Any], index: int) -> CodecRecord:
+    where = _where("codec", index, record.get("slug"))
+    _reject_unknown(
+        record,
+        {"slug", "codec", "encoder", "preset", "crf", "encoder_args", "bitstream_muxer"},
+        where,
+    )
+    return CodecRecord(
+        slug=_str(record, "slug", where),
+        codec=_str(record, "codec", where),
+        encoder=_str(record, "encoder", where),
+        preset=_str(record, "preset", where),
+        crf=_int(record, "crf", where, minimum=0),
+        encoder_args=_str_list(record, "encoder_args", where),
+        bitstream_muxer=_str(record, "bitstream_muxer", where),
+    )
+
+
+def _pair(record: Mapping[str, Any], index: int) -> PairRecord:
+    where = _where("pair", index, None)
+    _reject_unknown(record, {"input_res", "output_res"}, where)
+    return PairRecord(
+        input_res=_str(record, "input_res", where),
+        output_res=_str(record, "output_res", where),
+    )
+
+
+def _video(record: Mapping[str, Any], index: int) -> VideoRecord:
+    where = _where("video", index, record.get("slug"))
+    _reject_unknown(record, {"slug", "title", "frame_rate", "frames", "geometry", "source"}, where)
+    return VideoRecord(
+        slug=_str(record, "slug", where),
+        title=_str(record, "title", where),
+        frame_rate=_rational(record, "frame_rate", where),
+        frames=_int(record, "frames", where, minimum=1),
+        geometry=_geometry(record, where),
+        source=_source(record, where),
+    )
+
+
+def _instance(record: Mapping[str, Any], index: int) -> InstanceRecord:
+    where = _where("instance", index, record.get("id"))
+    _reject_unknown(record, {"id", "instance_type", "arch", *_CPU_OPTIONS_KEYS}, where)
+    instance_id = _str(record, "id", where)
+    if SCENARIO_ID_SEPARATOR in instance_id:
+        raise ConfigError(
+            f"{where}: 'id' must not contain '{SCENARIO_ID_SEPARATOR}', "
+            f"the separator of the scenario_id"
+        )
+    return InstanceRecord(
+        id=instance_id,
+        instance_type=_str(record, "instance_type", where),
+        arch=_str(record, "arch", where),
+        cpu_options=_cpu_options(record, where),
+    )
+
+
+def _cpu_options(record: Mapping[str, Any], where: str) -> CpuOptions | None:
+    declared = [key for key in _CPU_OPTIONS_KEYS if key in record]
+    if not declared:
+        return None
+    if len(declared) != len(_CPU_OPTIONS_KEYS):
+        (missing,) = set(_CPU_OPTIONS_KEYS) - set(declared)
+        raise ConfigError(
+            f"{where}: '{declared[0]}' and '{missing}' are declared together or not at all"
+        )
+    return CpuOptions(
+        core_count=_int(record, "core_count", where, minimum=1),
+        threads_per_core=_int(record, "threads_per_core", where, minimum=1),
+    )
+
+
+def _source(record: Mapping[str, Any], where: str) -> SourceRecord:
+    table = _require(record, "source", where)
+    source_where = f"{where}: source"
+    if not isinstance(table, Mapping):
+        raise ConfigError(f"{source_where} must be a table with 'url', 'file', 'size' and 'sha256'")
+
+    _reject_unknown(table, {"url", "file", "size", "sha256"}, source_where)
+    return SourceRecord(
+        url=_str(table, "url", source_where),
+        file=_str(table, "file", source_where),
+        size=_int(table, "size", source_where, minimum=1),
+        sha256=_sha256(table, "sha256", source_where),
+    )
+
+
+def _geometry(record: Mapping[str, Any], where: str) -> Mapping[str, Geometry]:
+    table = _require(record, "geometry", where)
+    if not isinstance(table, Mapping) or not table:
+        raise ConfigError(f"{where}: 'geometry' must be a non-empty table of tiers")
+
+    geometry: dict[str, Geometry] = {}
+    for tier, dimensions in table.items():
+        tier_where = f"{where}: geometry['{tier}']"
+        if not isinstance(dimensions, Mapping):
+            raise ConfigError(f"{tier_where} must be a table with 'width' and 'height'")
+        _reject_unknown(dimensions, {"width", "height"}, tier_where)
+        geometry[tier] = Geometry(
+            width=_even(dimensions, "width", tier_where),
+            height=_even(dimensions, "height", tier_where),
+        )
+    return geometry
+
+
+def _reject_ambiguous_warmup(warmup_runs: int) -> None:
+    """A chave termina em `_warmup`, sem índice, então um segundo warm-up produziria
+    duas chaves idênticas.
+    """
+    if warmup_runs > 1:
+        raise ConfigError(
+            f"experiment: 'warmup_runs' must be 0 or 1, got {warmup_runs} "
+            "(a second warm-up would collide on the scenario_id, which has a single slot)"
+        )
+
+
+def _reject_missing_geometry(pairs: Sequence[PairRecord], videos: Sequence[VideoRecord]) -> None:
+    """Sem isto, o `scale=` do FFmpeg receberia dimensão vazia — e a asserção de
+    "nunca upscale" abaixo não teria números sobre os quais operar.
+    """
+    for video_index, video in enumerate(videos):
+        where = _where("video", video_index, video.slug)
+        for pair_index, pair in enumerate(pairs):
+            for tier in (pair.input_res, pair.output_res):
+                if tier not in video.geometry:
+                    raise ConfigError(
+                        f"{where}: missing geometry for tier '{tier}', "
+                        f"referenced by pair[{pair_index}] {pair}"
+                    )
+
+
+def _reject_upscale(pairs: Sequence[PairRecord], videos: Sequence[VideoRecord]) -> None:
+    """Os tiers são nomes nominais: `1080p` não é 1920x1080 para os dois vídeos,
+    então comparar strings não diz nada sobre pixels.
+    """
+    for pair_index, pair in enumerate(pairs):
+        for video in videos:
+            source = video.geometry[pair.input_res]
+            target = video.geometry[pair.output_res]
+            if not target.fits_within(source):
+                raise ConfigError(
+                    f"pair[{pair_index}] {pair}: upscale for video '{video.slug}' "
+                    f"({source} -> {target})"
+                )
+
+
+def _reject_duplicates(values: Iterable[Hashable], family: str, label: str) -> None:
+    seen: dict[Hashable, int] = {}
+    for index, value in enumerate(values):
+        if value in seen:
+            raise ConfigError(
+                f"{family}[{index}]: duplicate {label} '{value}' "
+                f"(already declared at {family}[{seen[value]}])"
+            )
+        seen[value] = index
+
+
+def _where(family: str, index: int, identity: Any) -> str:
+    return f"{family}[{index}] '{identity}'" if isinstance(identity, str) else f"{family}[{index}]"
+
+
+def _table(raw: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    if key not in raw:
+        raise ConfigError(f"missing required table '{key}'")
+    value = raw[key]
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"'{key}' must be a table, got {type(value).__name__}")
+    return value
+
+
+def _records(raw: Mapping[str, Any], key: str) -> Sequence[Mapping[str, Any]]:
+    if key not in raw:
+        raise ConfigError(f"missing required array of tables '{key}'")
+    value = raw[key]
+    if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+        raise ConfigError(f"'{key}' must be an array of tables")
+    if not value:
+        raise ConfigError(f"'{key}': at least one record is required")
+    return value
+
+
+def _require(record: Mapping[str, Any], key: str, where: str) -> Any:
+    if key not in record:
+        raise ConfigError(f"{where}: missing required key '{key}'")
+    return record[key]
+
+
+def _int(record: Mapping[str, Any], key: str, where: str, *, minimum: int | None = None) -> int:
+    value = _require(record, key, where)
+    # `bool` é subclasse de `int`: sem esta guarda, `seed = true` passaria.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{where}: '{key}' must be an integer, got {type(value).__name__}")
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{where}: '{key}' must be >= {minimum}, got {value}")
+    return value
+
+
+def _positive_number(record: Mapping[str, Any], key: str, where: str) -> float:
+    value = _require(record, key, where)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigError(f"{where}: '{key}' must be a number, got {type(value).__name__}")
+    if value <= 0:
+        raise ConfigError(f"{where}: '{key}' must be > 0, got {value}")
+    return float(value)
+
+
+def _even(record: Mapping[str, Any], key: str, where: str) -> int:
+    """Dimensão de imagem: positiva e par, porque `yuv420p` subamostra o croma 2x2."""
+    value = _int(record, key, where, minimum=1)
+    if value % 2:
+        raise ConfigError(f"{where}: '{key}' must be even for yuv420p, got {value}")
+    return value
+
+
+def is_sha256(value: str) -> bool:
+    """A forma que o `sha256sum` emite, e a única que ele compara de volta."""
+    return len(value) == SHA256_DIGITS and not set(value) - _HEX_DIGITS
+
+
+def _sha256(record: Mapping[str, Any], key: str, where: str) -> str:
+    value = _str(record, key, where)
+    if not is_sha256(value):
+        raise ConfigError(
+            f"{where}: '{key}' must be {SHA256_DIGITS} lowercase hexadecimal digits, got '{value}'"
+        )
+    return value
+
+
+def _rational(record: Mapping[str, Any], key: str, where: str) -> str:
+    value = _str(record, key, where)
+    numerator, slash, denominator = value.partition("/")
+    digits = numerator.isdigit() and denominator.isdigit()
+    if not slash or not digits or int(numerator) <= 0 or int(denominator) <= 0:
+        raise ConfigError(
+            f"{where}: '{key}' must be a rational 'num/den' of positive integers, got '{value}'"
+        )
+    return value
+
+
+def _str(record: Mapping[str, Any], key: str, where: str) -> str:
+    value = _require(record, key, where)
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{where}: '{key}' must be a non-empty string")
+    return value
+
+
+def _bool(record: Mapping[str, Any], key: str, where: str) -> bool:
+    value = _require(record, key, where)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{where}: '{key}' must be a boolean, got {type(value).__name__}")
+    return value
+
+
+def _str_list(record: Mapping[str, Any], key: str, where: str) -> tuple[str, ...]:
+    """Um elemento vazio não some: ele vira um argumento presente e sem valor no
+    argv do FFmpeg ou no `-e` do `perf stat`, e o erro aparece longe daqui.
+    """
+    value = _require(record, key, where)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{where}: '{key}' must be a list of strings")
+    if any(not item for item in value):
+        raise ConfigError(f"{where}: '{key}' must not contain an empty string")
+    return tuple(value)
+
+
+def _reject_unknown(record: Mapping[str, Any], allowed: Iterable[str], where: str) -> None:
+    unknown = sorted(set(record) - set(allowed))
+    if unknown:
+        listed = ", ".join(f"'{key}'" for key in unknown)
+        raise ConfigError(f"{where}: unknown key(s) {listed}")

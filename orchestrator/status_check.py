@@ -1,0 +1,196 @@
+"""Os dois objetos de `status/` que o `run_all.sh` escreve, lidos pelo Orquestrador."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from field_checks import (
+    FieldError,
+    check_aware_timestamp,
+    check_bool,
+    check_fields,
+    check_int,
+    check_non_empty_str,
+)
+
+LONGEST_INSTANCE = "c7i-nosmt"
+INSTANCE_WIDTH = len(LONGEST_INSTANCE)
+HOUR_WIDTH = 8
+
+LONGEST_SCENARIO_ID = f"libsvtav1_2160p_2160p_bbb_{LONGEST_INSTANCE}_warmup"
+SCENARIO_WIDTH = len(LONGEST_SCENARIO_ID) + 1
+
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_MINUTE = 60
+
+STATUS_PREFIX = "status/"
+
+# A chave é contrato do layout do bucket e o valor do papel é contrato do arquivo de
+# estado: colapsar os dois num `role.value` faz renomear um renomear o outro.
+JUDGE_STEM = "judge"
+
+
+class StatusError(Exception):
+    """Objeto de `status/` que o Orquestrador recusa a ler, com o campo ofensor nomeado."""
+
+
+class Role(Enum):
+    ENCODE = "encode"
+    JUDGE = "judge"
+
+
+@dataclass(frozen=True)
+class DoneMarker:
+    instance_id: str
+    finished_at: str
+    runs_total: int
+    runs_failed: int
+    capped: bool
+    exit_status: int
+
+
+@dataclass(frozen=True)
+class Progress:
+    instance_id: str
+    block_index: int
+    block_count: int
+    run_index: int
+    run_count: int
+    scenario_id: str
+    runs_total: int
+    runs_failed: int
+    elapsed_seconds: int
+    written_at: str
+
+
+@dataclass(frozen=True)
+class JudgeProgress:
+    instance_id: str
+    output_index: int
+    output_count: int
+    run_id: str
+    scenario_id: str
+    runs_total: int
+    runs_failed: int
+    elapsed_seconds: int
+    written_at: str
+
+
+@dataclass(frozen=True)
+class StatusKeys:
+    done: str
+    progress: str
+
+    @classmethod
+    def of(cls, role: Role, instance: str) -> StatusKeys:
+        stem = instance if role is Role.ENCODE else JUDGE_STEM
+        return cls(
+            done=f"{STATUS_PREFIX}{stem}_done",
+            progress=f"{STATUS_PREFIX}{stem}_progress",
+        )
+
+
+def check_done_marker(payload: Any, *, instance_id: str) -> DoneMarker | None:
+    return _checked(DoneMarker, payload, "marcador", instance_id)
+
+
+def check_judge_done(payload: Any) -> DoneMarker:
+    return DoneMarker(**_fields(DoneMarker, payload, "marcador do Juiz"))
+
+
+def check_progress(payload: Any, *, instance_id: str) -> Progress | None:
+    return _checked(Progress, payload, "progresso", instance_id)
+
+
+def check_judge_progress(payload: Any, *, instance_id: str) -> JudgeProgress | None:
+    return _checked(JudgeProgress, payload, "progresso do Juiz", instance_id)
+
+
+def progress_line(progress: Progress | None, *, instance: str, runs_total: int) -> str:
+    if progress is None:
+        return (
+            f"{'':{HOUR_WIDTH}} {instance:<{INSTANCE_WIDTH}} "
+            f"sem progresso ainda, 0/{runs_total} runs reportados"
+        )
+
+    return (
+        f"{hour_of(progress.written_at)} {instance:<{INSTANCE_WIDTH}} "
+        f"bloco {_index_over_total(progress.block_index, progress.block_count)}  "
+        f"run {_index_over_total(progress.run_index, progress.run_count)}  "
+        f"{progress.scenario_id:<{SCENARIO_WIDTH}}"
+        f"{_index_over_total(progress.runs_total, runs_total)} runs, "
+        f"{progress.runs_failed} falhas, {_elapsed(progress.elapsed_seconds)}"
+    )
+
+
+def judge_progress_line(progress: JudgeProgress | None) -> str:
+    if progress is None:
+        return (
+            f"{'':{HOUR_WIDTH}} {JUDGE_STEM:<{INSTANCE_WIDTH}} "
+            f"sem progresso ainda, nenhum output julgado"
+        )
+
+    return (
+        f"{hour_of(progress.written_at)} {JUDGE_STEM:<{INSTANCE_WIDTH}} "
+        f"output {_index_over_total(progress.output_index, progress.output_count)}  "
+        f"{progress.scenario_id:<{SCENARIO_WIDTH}}"
+        f"{_index_over_total(progress.runs_total, progress.output_count)} runs, "
+        f"{progress.runs_failed} falhas, {_elapsed(progress.elapsed_seconds)}"
+    )
+
+
+def hour_of(timestamp: str) -> str:
+    return datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
+
+
+def _checked[T](record: type[T], payload: Any, what: str, instance_id: str) -> T | None:
+    values = _fields(record, payload, what)
+    if values["instance_id"] != instance_id:
+        return None
+    return record(**values)
+
+
+def _fields(record: type, payload: Any, what: str) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise StatusError(f"{what}: não é um objeto JSON: {type(payload).__name__}")
+
+    try:
+        return check_fields(record, payload, _CHECKS)
+    except FieldError as error:
+        raise StatusError(str(error)) from error
+
+
+def _index_over_total(index: int, total: int) -> str:
+    return f"{index:>{len(str(total))}}/{total}"
+
+
+def _elapsed(seconds: int) -> str:
+    hours, rest = divmod(seconds, SECONDS_PER_HOUR)
+    minutes = rest // SECONDS_PER_MINUTE
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m"
+
+
+_CHECKS: dict[str, Callable[[str, Any], None]] = {
+    "instance_id": check_non_empty_str,
+    "finished_at": check_aware_timestamp,
+    "written_at": check_aware_timestamp,
+    "scenario_id": check_non_empty_str,
+    "block_index": check_int,
+    "block_count": check_int,
+    "run_index": check_int,
+    "run_count": check_int,
+    "run_id": check_non_empty_str,
+    "output_index": check_int,
+    "output_count": check_int,
+    "runs_total": check_int,
+    "runs_failed": check_int,
+    "elapsed_seconds": check_int,
+    "capped": check_bool,
+    "exit_status": check_int,
+}

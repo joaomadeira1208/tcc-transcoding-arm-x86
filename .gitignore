@@ -1,0 +1,39 @@
+# Allowlist: o repo é clonado em instâncias com IP público, e um blocklist
+# depende de lembrar de cada segredo.
+*
+
+!*/
+
+!*.py
+!*.sh
+!*.tf
+!*.toml
+!*.md
+!Dockerfile
+!requirements.txt
+!requirements-dev.txt
+!ruff.toml
+!.gitignore
+!.pre-commit-config.yaml
+!LICENSE
+!dados/**/*.parquet
+# Por nome, e não por extensão: `.json` na raiz de um papel é o `meta.json`
+# e o `scenarios.json` de runtime, que ficam fora.
+!meta.schema.json
+!judge.schema.json
+
+!.github/workflows/*.yml
+
+!infra/**/.terraform.lock.hcl
+
+# Enumerada por extensão, e não como `!**/fixtures/*`, porque a captura da camada
+# de aceite tem o output.mkv ao lado das saídas de texto.
+!**/fixtures/*.json
+!**/fixtures/*.txt
+!**/fixtures/*.log
+
+.venv*/
+venv/
+.terraform/
+runs/
+__pycache__/

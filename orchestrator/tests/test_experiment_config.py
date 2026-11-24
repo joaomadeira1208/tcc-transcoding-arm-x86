@@ -1,0 +1,1001 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from conftest import (
+    ABSENT,
+    make_codec,
+    make_encode,
+    make_geometry,
+    make_instance,
+    make_instrumentation,
+    make_judge,
+    make_metric,
+    make_quality,
+    make_source,
+    make_video,
+    real_config,
+    real_pilot_config,
+)
+from experiment_config import ConfigError, ExperimentConfig, validate_config
+
+EXPECTED_PAIRS = {
+    ("2160p", "2160p"),
+    ("2160p", "1080p"),
+    ("2160p", "720p"),
+    ("2160p", "480p"),
+    ("1080p", "1080p"),
+    ("1080p", "720p"),
+    ("1080p", "480p"),
+    ("720p", "720p"),
+    ("720p", "480p"),
+}
+
+# Transcrição, não uma contagem: um evento trocado mantém o `len`
+# intacto, e a ordem é parte do que se congela — é ela que vai para o `-e` do
+# `perf stat`.
+EXPECTED_PMU_EVENTS = [
+    "cycles",
+    "instructions",
+    "branch-instructions",
+    "branch-misses",
+    "task-clock",
+    "context-switches",
+    "cpu-migrations",
+    "page-faults",
+]
+
+EXPECTED_METRIC_PAIRS = {
+    "ipc": ("instructions", "cycles"),
+    "branch_mispredict_rate": ("branch-misses", "branch-instructions"),
+}
+
+EXPECTED_EVENT_SPEC = (
+    "{cycles,instructions},"
+    "{branch-instructions,branch-misses},"
+    "task-clock,context-switches,cpu-migrations,page-faults"
+)
+
+EXPECTED_HARDWARE_EVENTS = [
+    "cycles",
+    "instructions",
+    "branch-instructions",
+    "branch-misses",
+]
+
+EXPECTED_BITSTREAM_MUXERS = {
+    "libx264": "h264",
+    "libx265": "hevc",
+    "libsvtav1": "obu",
+}
+
+EXPECTED_GEOMETRY = {
+    "bbb": {
+        "2160p": (3840, 2160),
+        "1080p": (1920, 1080),
+        "720p": (1280, 720),
+        "480p": (854, 480),
+    },
+    "tos": {
+        "2160p": (3840, 1714),
+        "1080p": (1920, 856),
+        "720p": (1280, 572),
+        "480p": (854, 382),
+    },
+}
+
+EXPECTED_QUALITY = {
+    "vmaf_model": "vmaf_v0.6.1",
+    "vmaf_delta_max": 0.5,
+    "ssim_delta_max": 0.001,
+    "judge": ("c7i.4xlarge", "x86_64"),
+}
+
+EXPECTED_SOURCES = {
+    "bbb": {
+        "file": "bbb_sunflower_2160p_30fps_normal.mp4",
+        "url": (
+            "https://ftp.nluug.nl/pub/graphics/blender/demo/movies/BBB/bbb_sunflower_2160p_30fps_normal.mp4.zip"
+        ),
+        "size": 633016449,
+        "sha256": "37f0ff251a606c2dcfa26c19fe6bf843234b4e7a8889cfab50bc26f644e55520",
+    },
+    "tos": {
+        "file": "tearsofsteel_4k.mov",
+        "url": "https://ftp.nluug.nl/pub/graphics/blender/demo/movies/ToS/tearsofsteel_4k.mov.zip",
+        "size": 6737592810,
+        "sha256": "89b7fd21c7729b7d5071af993939997f847b5af06613a3388ba158dae9e52ab3",
+    },
+}
+
+# O `ffprobe` da imagem de medição sobre os dois arquivos acima.
+EXPECTED_FRAME_RATE_AND_COUNT = {
+    "bbb": ("30/1", 19036),
+    "tos": ("24/1", 17616),
+}
+
+
+EXPECTED_SEED = 20260808
+
+PILOT_PAIRS = {("1080p", "720p")}
+
+
+def declared_sources(config: ExperimentConfig) -> dict[str, dict[str, Any]]:
+    return {
+        video.slug: {
+            "file": video.source.file,
+            "url": video.source.url,
+            "size": video.source.size,
+            "sha256": video.source.sha256,
+        }
+        for video in config.videos
+    }
+
+
+def declared_frame_rate_and_count(config: ExperimentConfig) -> dict[str, tuple[str, int]]:
+    return {video.slug: (video.frame_rate, video.frames) for video in config.videos}
+
+
+def declared_quality(config: ExperimentConfig) -> dict[str, Any]:
+    quality = config.quality
+    return {
+        "vmaf_model": quality.vmaf_model,
+        "vmaf_delta_max": quality.vmaf_delta_max,
+        "ssim_delta_max": quality.ssim_delta_max,
+        "judge": (quality.judge.instance_type, quality.judge.arch),
+    }
+
+
+class TestAccepts:
+    def test_minimal_config(self, make_raw_config):
+        config = validate_config(make_raw_config())
+
+        assert config.seed == 1
+        assert config.replications == 5
+        assert config.warmup_runs == 1
+        assert [c.slug for c in config.codecs] == ["libx264"]
+        assert [(p.input_res, p.output_res) for p in config.pairs] == [
+            ("1080p", "1080p"),
+            ("1080p", "720p"),
+        ]
+
+    def test_records_keep_declaration_order(self, make_raw_config):
+        # A ordem pré-shuffle do plano é a ordem de declaração do TOML: se
+        # a validação reordenasse os registros, o determinismo do plano
+        # dependeria de um detalhe invisível aqui.
+        raw = make_raw_config(
+            instance=[
+                make_instance(id="c7i", instance_type="c7i.xlarge", arch="x86_64"),
+                make_instance(id="c7g", instance_type="c7g.xlarge", arch="arm64"),
+            ]
+        )
+
+        assert [i.id for i in validate_config(raw).instances] == ["c7i", "c7g"]
+
+
+class TestRealExperimentToml:
+    def test_is_valid(self):
+        config = real_config()
+
+        assert config.seed == EXPECTED_SEED
+        assert config.replications == 5
+        assert config.warmup_runs == 1
+        assert [c.slug for c in config.codecs] == ["libx264", "libx265", "libsvtav1"]
+        assert [v.slug for v in config.videos] == ["bbb", "tos"]
+        assert [i.id for i in config.instances] == ["c7g", "c7i", "c7a"]
+
+    def test_declares_exactly_the_nine_pairs_of_the_spec(self):
+        pairs = [(p.input_res, p.output_res) for p in real_config().pairs]
+
+        assert set(pairs) == EXPECTED_PAIRS
+        assert len(pairs) == len(EXPECTED_PAIRS)
+
+    def test_declares_the_geometry_of_every_tier_of_every_video(self):
+        declared = {
+            video.slug: {tier: (g.width, g.height) for tier, g in video.geometry.items()}
+            for video in real_config().videos
+        }
+
+        assert declared == EXPECTED_GEOMETRY
+
+    def test_declares_the_bitstream_muxer_of_every_codec(self):
+        muxers = {c.slug: c.bitstream_muxer for c in real_config().codecs}
+
+        assert muxers == EXPECTED_BITSTREAM_MUXERS
+
+    def test_declares_the_ten_pmu_events_in_order(self):
+        assert list(real_config().instrumentation.pmu_events) == EXPECTED_PMU_EVENTS
+
+    def test_declares_the_three_metrics_with_their_pairs(self):
+        declared = {
+            metric.name: (metric.numerator, metric.denominator)
+            for metric in real_config().instrumentation.metrics
+        }
+
+        assert declared == EXPECTED_METRIC_PAIRS
+
+    def test_the_event_argument_groups_each_pair_and_leaves_the_rest_loose(self):
+        # O `-e` é o que decide se as três razões são medidas ou inventadas: sem
+        # as chaves, o kernel escalona cada evento por conta e o numerador de uma
+        # razão passa a ser medido numa janela diferente do denominador.
+        assert real_config().instrumentation.event_spec == EXPECTED_EVENT_SPEC
+
+    def test_the_event_argument_flattens_to_the_declared_order(self):
+        # Os membros de um grupo saem na ordem de `pmu_events`, de modo que o
+        # `perf.json` continue trazendo os contadores na ordem da spec.
+        spec = real_config().instrumentation.event_spec
+
+        assert spec.replace("{", "").replace("}", "").split(",") == EXPECTED_PMU_EVENTS
+
+    def test_the_hardware_events_are_exactly_the_grouped_ones(self):
+        assert list(real_config().instrumentation.hardware_events) == EXPECTED_HARDWARE_EVENTS
+
+    def test_pins_the_source_file_of_every_video(self):
+        assert declared_sources(real_config()) == EXPECTED_SOURCES
+
+    def test_declares_the_frame_rate_and_the_frame_count_of_every_video(self):
+        assert declared_frame_rate_and_count(real_config()) == EXPECTED_FRAME_RATE_AND_COUNT
+
+    def test_declares_the_quality_pass(self):
+        assert declared_quality(real_config()) == EXPECTED_QUALITY
+
+    def test_ties_preset_and_crf_to_each_codec(self):
+        codecs = {c.slug: (c.preset, c.crf) for c in real_config().codecs}
+
+        assert codecs == {
+            "libx264": ("medium", 23),
+            "libx265": ("medium", 28),
+            "libsvtav1": ("8", 35),
+        }
+
+
+class TestRealPilotToml:
+    def test_is_valid(self):
+        config = real_pilot_config()
+
+        assert config.replications == 5
+        assert config.warmup_runs == 1
+        assert [c.slug for c in config.codecs] == ["libx264", "libx265", "libsvtav1"]
+        assert [v.slug for v in config.videos] == ["bbb", "tos"]
+        assert [i.id for i in config.instances] == ["c7g", "c7i", "c7a"]
+
+    def test_declares_exactly_the_single_pair(self):
+        pairs = [(p.input_res, p.output_res) for p in real_pilot_config().pairs]
+
+        assert set(pairs) == PILOT_PAIRS
+        assert len(pairs) == len(PILOT_PAIRS)
+
+    def test_declares_the_geometry_of_every_tier_of_every_video(self):
+        # Apagar os dois tiers que o piloto não usa deixa o arquivo válido e o
+        # registro do vídeo diferente do da campanha.
+        declared = {
+            video.slug: {tier: (g.width, g.height) for tier, g in video.geometry.items()}
+            for video in real_pilot_config().videos
+        }
+
+        assert declared == EXPECTED_GEOMETRY
+
+    def test_pins_the_same_sources_as_the_campaign(self):
+        assert declared_sources(real_pilot_config()) == EXPECTED_SOURCES
+
+    def test_declares_the_same_frame_rate_and_frame_count_as_the_campaign(self):
+        assert declared_frame_rate_and_count(real_pilot_config()) == EXPECTED_FRAME_RATE_AND_COUNT
+
+    def test_carries_the_seed_of_the_campaign(self):
+        assert real_pilot_config().seed == EXPECTED_SEED
+
+    def test_judges_with_the_model_and_the_thresholds_of_the_campaign(self):
+        assert declared_quality(real_pilot_config()) == EXPECTED_QUALITY
+
+
+class TestRejectsUpscale:
+    def test_pair_that_upscales(self, make_raw_config):
+        raw = make_raw_config(pair=[{"input_res": "720p", "output_res": "1080p"}])
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "pair[0]" in message
+        assert "720p" in message and "1080p" in message
+        assert "bbb" in message
+
+    def test_upscale_hidden_behind_a_downscale_label(self, make_raw_config):
+        # O rótulo diz 1080p → 720p, que parece downscale; a geometria declarada
+        # para este vídeo diz o contrário.
+        raw = make_raw_config(
+            video=[
+                make_video(geometry=make_geometry(**{"1080p": (1920, 1080), "720p": (2560, 1440)}))
+            ]
+        )
+
+        with pytest.raises(ConfigError, match=r"pair\[1\]"):
+            validate_config(raw)
+
+    def test_upscale_in_only_one_dimension(self, make_raw_config):
+        # Altura cabe, largura não: o par continua sendo upscale. Comparar área ou
+        # só a altura deixaria isto passar.
+        raw = make_raw_config(
+            video=[
+                make_video(geometry=make_geometry(**{"1080p": (1920, 1080), "720p": (2560, 720)}))
+            ]
+        )
+
+        with pytest.raises(ConfigError, match=r"pair\[1\]"):
+            validate_config(raw)
+
+    def test_upscale_in_a_single_video(self, make_raw_config):
+        raw = make_raw_config(
+            video=[
+                make_video(),
+                make_video(
+                    slug="tos",
+                    title="Tears of Steel",
+                    geometry=make_geometry(**{"1080p": (1920, 804), "720p": (1920, 900)}),
+                ),
+            ]
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        assert "tos" in str(excinfo.value)
+
+
+class TestRejectsBadGeometry:
+    def test_tier_referenced_by_a_pair_without_geometry_in_some_video(self, make_raw_config):
+        raw = make_raw_config(
+            video=[
+                make_video(),
+                make_video(
+                    slug="tos",
+                    title="Tears of Steel",
+                    geometry=make_geometry(**{"1080p": (1920, 804)}),
+                ),
+            ]
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "tos" in message
+        assert "720p" in message
+
+    def test_non_positive_dimension(self, make_raw_config):
+        raw = make_raw_config(
+            video=[make_video(geometry=make_geometry(**{"1080p": (1920, 1080), "720p": (1280, 0)}))]
+        )
+
+        with pytest.raises(ConfigError, match="bbb"):
+            validate_config(raw)
+
+    def test_odd_dimension(self, make_raw_config):
+        # `yuv420p` subamostra o croma 2x2: uma altura ímpar não
+        # estoura aqui, estoura no FFmpeg depois que o plano já foi distribuído.
+        raw = make_raw_config(
+            video=[
+                make_video(geometry=make_geometry(**{"1080p": (1920, 1080), "720p": (1280, 721)}))
+            ]
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "bbb" in message
+        assert "720p" in message
+
+
+class TestRejectsBadSource:
+    def test_missing_source_table(self, make_raw_config):
+        video = make_video()
+        del video["source"]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(video=[video]))
+
+        message = str(excinfo.value)
+        assert "video[0]" in message
+        assert "bbb" in message
+        assert "source" in message
+
+    def test_source_that_is_not_a_table(self, make_raw_config):
+        raw = make_raw_config(video=[make_video(source="bbb_sunflower_2160p_30fps_normal.mp4")])
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        assert "bbb" in str(excinfo.value)
+        assert "source" in str(excinfo.value)
+
+    @pytest.mark.parametrize("field", ["url", "file", "size", "sha256"])
+    def test_source_missing_field(self, make_raw_config, field):
+        source = make_source()
+        del source[field]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(video=[make_video(source=source)]))
+
+        message = str(excinfo.value)
+        assert "bbb" in message
+        assert field in message
+
+    def test_unknown_key_in_the_source_table(self, make_raw_config):
+        raw = make_raw_config(video=[make_video(source=make_source(md5="d41d8cd98f00b204e980"))])
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "bbb" in message
+        assert "md5" in message
+
+    def test_sha256_of_the_wrong_length(self, make_raw_config):
+        truncated = make_source()["sha256"][:-1]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(
+                make_raw_config(video=[make_video(source=make_source(sha256=truncated))])
+            )
+
+        message = str(excinfo.value)
+        assert "bbb" in message
+        assert "sha256" in message
+
+    def test_sha256_that_is_not_hexadecimal(self, make_raw_config):
+        not_hex = "z" + make_source()["sha256"][1:]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(video=[make_video(source=make_source(sha256=not_hex))]))
+
+        message = str(excinfo.value)
+        assert "bbb" in message
+        assert "sha256" in message
+
+    def test_non_positive_size(self, make_raw_config):
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(video=[make_video(source=make_source(size=0))]))
+
+        message = str(excinfo.value)
+        assert "bbb" in message
+        assert "size" in message
+
+    def test_size_that_is_a_string(self, make_raw_config):
+        raw = make_raw_config(video=[make_video(source=make_source(size="633016449"))])
+
+        with pytest.raises(ConfigError, match="size"):
+            validate_config(raw)
+
+    def test_empty_url(self, make_raw_config):
+        with pytest.raises(ConfigError, match="url"):
+            validate_config(make_raw_config(video=[make_video(source=make_source(url=""))]))
+
+    def test_empty_file(self, make_raw_config):
+        with pytest.raises(ConfigError, match="file"):
+            validate_config(make_raw_config(video=[make_video(source=make_source(file=""))]))
+
+
+class TestRejectsBadFrameRateAndCount:
+    @pytest.mark.parametrize("field", ["frame_rate", "frames"])
+    def test_video_missing_field(self, make_raw_config, field):
+        video = make_video()
+        del video[field]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(video=[video]))
+
+        message = str(excinfo.value)
+        assert "video[0]" in message
+        assert field in message
+
+    def test_frame_rate_that_is_a_number(self, make_raw_config):
+        with pytest.raises(ConfigError, match="frame_rate"):
+            validate_config(make_raw_config(video=[make_video(frame_rate=30.0)]))
+
+    @pytest.mark.parametrize("value", ["30", "banana", "30/", "/1", "30/1.5", "-30/1", "30/0"])
+    def test_frame_rate_that_is_not_a_rational(self, make_raw_config, value):
+        with pytest.raises(ConfigError, match="frame_rate"):
+            validate_config(make_raw_config(video=[make_video(frame_rate=value)]))
+
+    def test_frames_that_is_a_string(self, make_raw_config):
+        with pytest.raises(ConfigError, match="frames"):
+            validate_config(make_raw_config(video=[make_video(frames="19036")]))
+
+    def test_non_positive_frames(self, make_raw_config):
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(video=[make_video(frames=0)]))
+
+        message = str(excinfo.value)
+        assert "bbb" in message
+        assert "frames" in message
+
+
+class TestRejectsDuplicates:
+    def test_duplicate_codec_slug(self, make_raw_config):
+        raw = make_raw_config(codec=[make_codec(), make_codec(crf=26)])
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "codec[1]" in message
+        assert "libx264" in message
+
+    def test_duplicate_video_slug(self, make_raw_config):
+        raw = make_raw_config(video=[make_video(), make_video(title="Big Buck Bunny (again)")])
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "video[1]" in message
+        assert "bbb" in message
+
+    def test_duplicate_instance_id(self, make_raw_config):
+        raw = make_raw_config(
+            instance=[make_instance(), make_instance(instance_type="c7g.2xlarge")]
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "instance[1]" in message
+        assert "c7g" in message
+
+    def test_duplicate_pair(self, make_raw_config):
+        raw = make_raw_config(
+            pair=[
+                {"input_res": "1080p", "output_res": "720p"},
+                {"input_res": "1080p", "output_res": "720p"},
+            ]
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "pair[1]" in message
+        assert "1080p" in message and "720p" in message
+
+
+class TestRejectsMissingExperimentDesign:
+    def test_missing_seed(self, make_raw_config):
+        raw = make_raw_config(experiment={"replications": 5, "warmup_runs": 1})
+
+        with pytest.raises(ConfigError, match="seed"):
+            validate_config(raw)
+
+    def test_missing_replications(self, make_raw_config):
+        raw = make_raw_config(experiment={"seed": 1, "warmup_runs": 1})
+
+        with pytest.raises(ConfigError, match="replications"):
+            validate_config(raw)
+
+    def test_missing_warmup_runs(self, make_raw_config):
+        raw = make_raw_config(experiment={"seed": 1, "replications": 5})
+
+        with pytest.raises(ConfigError, match="warmup_runs"):
+            validate_config(raw)
+
+    def test_missing_experiment_table(self, make_raw_config):
+        raw = make_raw_config(experiment=ABSENT)
+
+        with pytest.raises(ConfigError, match="experiment"):
+            validate_config(raw)
+
+    def test_seed_that_is_not_an_integer(self, make_raw_config):
+        raw = make_raw_config(experiment={"seed": "1", "replications": 5, "warmup_runs": 1})
+
+        with pytest.raises(ConfigError, match="seed"):
+            validate_config(raw)
+
+    def test_seed_that_is_a_boolean(self, make_raw_config):
+        # `bool` é subclasse de `int`: sem guarda explícita, `seed = true` viraria
+        # a seed 1 e o Experimento inteiro seria embaralhado por um typo.
+        raw = make_raw_config(experiment={"seed": True, "replications": 5, "warmup_runs": 1})
+
+        with pytest.raises(ConfigError, match="seed"):
+            validate_config(raw)
+
+    def test_more_than_one_warmup_run(self, make_raw_config):
+        # A `scenario_id` tem uma única vaga `_warmup`: dois warm-ups
+        # por Cenário produziriam chaves duplicadas, e a duplicata só apareceria
+        # na consolidação, depois do compute gasto.
+        raw = make_raw_config(experiment={"seed": 1, "replications": 5, "warmup_runs": 2})
+
+        with pytest.raises(ConfigError, match="warmup_runs"):
+            validate_config(raw)
+
+    def test_replications_below_one(self, make_raw_config):
+        raw = make_raw_config(experiment={"seed": 1, "replications": 0, "warmup_runs": 1})
+
+        with pytest.raises(ConfigError, match="replications"):
+            validate_config(raw)
+
+
+class TestRejectsIncompleteRecords:
+    @pytest.mark.parametrize("family", ["codec", "pair", "video", "instance"])
+    def test_empty_family(self, make_raw_config, family):
+        with pytest.raises(ConfigError, match=family):
+            validate_config(make_raw_config(**{family: []}))
+
+    @pytest.mark.parametrize(
+        "family", ["codec", "pair", "video", "instance", "encode", "instrumentation", "quality"]
+    )
+    def test_absent_family(self, make_raw_config, family):
+        with pytest.raises(ConfigError, match=family):
+            validate_config(make_raw_config(**{family: ABSENT}))
+
+    @pytest.mark.parametrize(
+        "field",
+        ["slug", "codec", "encoder", "preset", "crf", "encoder_args", "bitstream_muxer"],
+    )
+    def test_codec_missing_field(self, make_raw_config, field):
+        codec = make_codec()
+        del codec[field]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(codec=[codec]))
+
+        assert "codec[0]" in str(excinfo.value)
+        assert field in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "field", ["threads", "gop_size", "pix_fmt", "strip_audio", "container", "scale_flags"]
+    )
+    def test_fixed_encode_params_missing_field(self, make_raw_config, field):
+        encode = make_encode()
+        del encode[field]
+
+        with pytest.raises(ConfigError, match=field):
+            validate_config(make_raw_config(encode=encode))
+
+    def test_instance_missing_arch(self, make_raw_config):
+        instance = make_instance()
+        del instance["arch"]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(instance=[instance]))
+
+        assert "instance[0]" in str(excinfo.value)
+        assert "arch" in str(excinfo.value)
+
+    def test_video_missing_geometry(self, make_raw_config):
+        video = make_video()
+        del video["geometry"]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(video=[video]))
+
+        assert "video[0]" in str(excinfo.value)
+        assert "geometry" in str(excinfo.value)
+
+    def test_crf_that_is_not_an_integer(self, make_raw_config):
+        with pytest.raises(ConfigError, match="crf"):
+            validate_config(make_raw_config(codec=[make_codec(crf="23")]))
+
+    def test_strip_audio_that_is_a_string(self, make_raw_config):
+        with pytest.raises(ConfigError, match="strip_audio"):
+            validate_config(make_raw_config(encode=make_encode(strip_audio="false")))
+
+    def test_unknown_key_in_a_record(self, make_raw_config):
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(codec=[make_codec(tune="film")]))
+
+        assert "codec[0]" in str(excinfo.value)
+        assert "tune" in str(excinfo.value)
+
+    def test_unknown_key_in_a_video_record(self, make_raw_config):
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(video=[make_video(fps=30)]))
+
+        message = str(excinfo.value)
+        assert "video[0]" in message
+        assert "fps" in message
+
+    def test_unknown_table_at_the_top_level(self, make_raw_config):
+        with pytest.raises(ConfigError, match="retention"):
+            validate_config(make_raw_config(retention={"keep": 10}))
+
+    def test_encoder_args_that_is_not_a_list_of_strings(self, make_raw_config):
+        with pytest.raises(ConfigError, match="encoder_args"):
+            validate_config(make_raw_config(codec=[make_codec(encoder_args="-sc_threshold 0")]))
+
+    def test_empty_bitstream_muxer(self, make_raw_config):
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(codec=[make_codec(bitstream_muxer="")]))
+
+        message = str(excinfo.value)
+        assert "codec[0]" in message
+        assert "bitstream_muxer" in message
+
+
+class TestRejectsBadInstrumentation:
+    def test_missing_pmu_events(self, make_raw_config):
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(instrumentation={}))
+
+        message = str(excinfo.value)
+        assert "instrumentation" in message
+        assert "pmu_events" in message
+
+    def test_empty_pmu_events(self, make_raw_config):
+        # Lista vazia é o pior caso: `perf stat` sem `-e` roda, coleta o conjunto
+        # default de eventos e devolve um JSON plausível — sem os oito de
+        # `config/experiment.toml`.
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(instrumentation=make_instrumentation(pmu_events=[])))
+
+        message = str(excinfo.value)
+        assert "instrumentation" in message
+        assert "pmu_events" in message
+
+    def test_duplicate_pmu_event(self, make_raw_config):
+        # `perf stat` aceita o evento repetido e emite duas entradas com o mesmo
+        # nome; quem lê o JSON por nome fica com uma delas, escolhida por acaso.
+        raw = make_raw_config(
+            instrumentation=make_instrumentation(pmu_events=["cycles", "instructions", "cycles"])
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "pmu_events[2]" in message
+        assert "cycles" in message
+
+    def test_empty_pmu_event(self, make_raw_config):
+        raw = make_raw_config(instrumentation=make_instrumentation(pmu_events=["cycles", ""]))
+
+        with pytest.raises(ConfigError, match="pmu_events"):
+            validate_config(raw)
+
+    def test_pmu_events_that_is_not_a_list_of_strings(self, make_raw_config):
+        raw = make_raw_config(instrumentation=make_instrumentation(pmu_events="cycles"))
+
+        with pytest.raises(ConfigError, match="pmu_events"):
+            validate_config(raw)
+
+    def test_unknown_key_in_the_instrumentation_table(self, make_raw_config):
+        raw = make_raw_config(instrumentation=make_instrumentation(sample_rate=1))
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "instrumentation" in message
+        assert "sample_rate" in message
+
+
+class TestRejectsBadMetrics:
+    @pytest.mark.parametrize("field", ["name", "numerator", "denominator", "max_ratio"])
+    def test_missing_field(self, make_raw_config, field):
+        raw = make_raw_config(
+            instrumentation=make_instrumentation(metric=[make_metric(**{field: ABSENT})])
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "metric[0]" in message
+        assert field in message
+
+    def test_missing_metric_table(self, make_raw_config):
+        # Sem grupo nenhum, o `perf` escalona os oito soltos e volta a multiplexar:
+        # numerador e denominador medidos em janelas diferentes.
+        raw = make_raw_config(instrumentation=make_instrumentation(metric=ABSENT))
+
+        with pytest.raises(ConfigError, match="metric"):
+            validate_config(raw)
+
+    def test_empty_metric_list(self, make_raw_config):
+        raw = make_raw_config(instrumentation=make_instrumentation(metric=[]))
+
+        with pytest.raises(ConfigError, match="metric"):
+            validate_config(raw)
+
+    def test_an_event_the_pmu_events_does_not_declare(self, make_raw_config):
+        raw = make_raw_config(
+            instrumentation=make_instrumentation(metric=[make_metric(numerator="branch-misses")])
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "metric[0]" in message
+        assert "branch-misses" in message
+        assert "pmu_events" in message
+
+    def test_the_same_event_in_two_groups(self, make_raw_config):
+        # Dois contadores para o mesmo evento, num orçamento que o c7g mostrou
+        # poder ser de três.
+        raw = make_raw_config(
+            instrumentation=make_instrumentation(
+                pmu_events=["cycles", "instructions", "context-switches"],
+                metric=[
+                    make_metric(),
+                    make_metric(name="outra", numerator="cycles", denominator="context-switches"),
+                ],
+            )
+        )
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "metric[1]" in message
+        assert "cycles" in message
+        assert "ipc" in message
+
+    def test_a_group_of_a_single_event(self, make_raw_config):
+        raw = make_raw_config(
+            instrumentation=make_instrumentation(
+                metric=[make_metric(numerator="cycles", denominator="cycles")]
+            )
+        )
+
+        with pytest.raises(ConfigError, match="cycles"):
+            validate_config(raw)
+
+    def test_duplicate_metric_name(self, make_raw_config):
+        raw = make_raw_config(
+            instrumentation=make_instrumentation(metric=[make_metric(), make_metric()])
+        )
+
+        with pytest.raises(ConfigError, match="ipc"):
+            validate_config(raw)
+
+    @pytest.mark.parametrize("ceiling", [0, -1.0, "10", True])
+    def test_a_ceiling_that_is_not_a_positive_number(self, make_raw_config, ceiling):
+        raw = make_raw_config(
+            instrumentation=make_instrumentation(metric=[make_metric(max_ratio=ceiling)])
+        )
+
+        with pytest.raises(ConfigError, match="max_ratio"):
+            validate_config(raw)
+
+    def test_unknown_key_in_a_metric(self, make_raw_config):
+        raw = make_raw_config(
+            instrumentation=make_instrumentation(metric=[make_metric(min_ratio=0.1)])
+        )
+
+        with pytest.raises(ConfigError, match="min_ratio"):
+            validate_config(raw)
+
+
+class TestRejectsBadQuality:
+    @pytest.mark.parametrize("field", ["vmaf_model", "vmaf_delta_max", "ssim_delta_max", "judge"])
+    def test_missing_field(self, make_raw_config, field):
+        quality = make_quality()
+        del quality[field]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(quality=quality))
+
+        message = str(excinfo.value)
+        assert "quality" in message
+        assert field in message
+
+    def test_model_that_is_not_a_string(self, make_raw_config):
+        # O nome vai literal para o `model=version=` do `libvmaf`, que resolve o
+        # arquivo do modelo por ele: qualquer outra coisa ali é um filtro que
+        # falha na instância, horas depois.
+        with pytest.raises(ConfigError, match="vmaf_model"):
+            validate_config(make_raw_config(quality=make_quality(vmaf_model=61)))
+
+    def test_empty_model(self, make_raw_config):
+        with pytest.raises(ConfigError, match="vmaf_model"):
+            validate_config(make_raw_config(quality=make_quality(vmaf_model="")))
+
+    @pytest.mark.parametrize("field", ["vmaf_delta_max", "ssim_delta_max"])
+    @pytest.mark.parametrize("threshold", ["0.5", True, 0, -0.5])
+    def test_threshold_that_is_not_a_positive_number(self, make_raw_config, field, threshold):
+        raw = make_raw_config(quality=make_quality(**{field: threshold}))
+
+        with pytest.raises(ConfigError, match=field):
+            validate_config(raw)
+
+    @pytest.mark.parametrize("field", ["instance_type", "arch"])
+    def test_judge_missing_field(self, make_raw_config, field):
+        judge = make_judge()
+        del judge[field]
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(quality=make_quality(judge=judge)))
+
+        message = str(excinfo.value)
+        assert "quality" in message
+        assert "judge" in message
+        assert field in message
+
+    def test_judge_that_is_not_a_table(self, make_raw_config):
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(make_raw_config(quality=make_quality(judge="c7i.4xlarge")))
+
+        message = str(excinfo.value)
+        assert "quality" in message
+        assert "judge" in message
+
+    def test_quality_that_is_not_a_table(self, make_raw_config):
+        with pytest.raises(ConfigError, match="quality"):
+            validate_config(make_raw_config(quality=["vmaf_v0.6.1"]))
+
+    def test_unknown_key_in_quality(self, make_raw_config):
+        with pytest.raises(ConfigError, match="scale_flags"):
+            validate_config(make_raw_config(quality=make_quality(scale_flags="bicubic")))
+
+    def test_unknown_key_in_the_judge(self, make_raw_config):
+        raw = make_raw_config(quality=make_quality(judge=make_judge(threads=16)))
+
+        with pytest.raises(ConfigError, match="threads"):
+            validate_config(raw)
+
+
+class TestCpuOptions:
+    # O par só existe junto: um `core_count` sozinho deixaria o `ThreadsPerCore`
+    # no default do tipo, e a topologia lançada não seria a declarada.
+
+    def test_an_instance_without_them_launches_with_the_default_of_the_type(self, make_raw_config):
+        (instance,) = validate_config(make_raw_config()).instances
+
+        assert instance.cpu_options is None
+
+    def test_both_together_are_accepted(self, make_raw_config):
+        raw = make_raw_config(instance=[make_instance(core_count=4, threads_per_core=1)])
+
+        (instance,) = validate_config(raw).instances
+
+        assert instance.cpu_options is not None
+        assert (instance.cpu_options.core_count, instance.cpu_options.threads_per_core) == (4, 1)
+        assert instance.cpu_options.vcpus == 4
+
+    @pytest.mark.parametrize(
+        ("present", "absent"),
+        [("core_count", "threads_per_core"), ("threads_per_core", "core_count")],
+    )
+    def test_one_without_the_other_is_rejected_naming_both(self, make_raw_config, present, absent):
+        raw = make_raw_config(instance=[make_instance(**{present: 2})])
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        message = str(excinfo.value)
+        assert "instance[0] 'c7g'" in message
+        assert present in message and absent in message
+
+    @pytest.mark.parametrize("value", [0, -1, True, "4"])
+    @pytest.mark.parametrize("field", ["core_count", "threads_per_core"])
+    def test_a_value_that_is_not_a_positive_integer_is_rejected(
+        self, make_raw_config, field, value
+    ):
+        options = {"core_count": 4, "threads_per_core": 1, field: value}
+        raw = make_raw_config(instance=[make_instance(**options)])
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        assert "instance[0]" in str(excinfo.value)
+        assert field in str(excinfo.value)
+
+
+class TestInstanceIds:
+    def test_a_hyphen_is_accepted(self, make_raw_config):
+        raw = make_raw_config(instance=[make_instance(id="c7i-nosmt")])
+
+        assert [i.id for i in validate_config(raw).instances] == ["c7i-nosmt"]
+
+    def test_an_underscore_is_rejected(self, make_raw_config):
+        # A `scenario_id` junta os campos com `_` e o `retention.py` tira a
+        # Instância dela por `rpartition`: um `c7i_nosmt` deixaria `c7i` no lugar
+        # do Cenário, e o `clean` casaria bitstreams de Cenários diferentes.
+        raw = make_raw_config(instance=[make_instance(id="c7i_nosmt")])
+
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(raw)
+
+        assert "instance[0] 'c7i_nosmt'" in str(excinfo.value)

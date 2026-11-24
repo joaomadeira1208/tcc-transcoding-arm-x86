@@ -1,0 +1,604 @@
+from __future__ import annotations
+
+import json
+import re
+
+import pytest
+from conftest import real_config
+from experiment_config import CpuOptions
+from preflight import (
+    ENCODE_STEPS,
+    JUDGE_STEPS,
+    NOT_COUNTED,
+    NOT_SUPPORTED,
+    PROBE_SECONDS,
+    SELF_CHECK_STEPS,
+    Outcome,
+    PreflightError,
+    Step,
+    StepResult,
+    container_topology,
+    failed,
+    perf_counters,
+    perf_detail,
+    perf_probe_command,
+    probe_encode_argv,
+    render_table,
+    summarize,
+    topology_detail,
+    vmaf_detail,
+    vmaf_score,
+)
+from scenario_plan import build_canonical_plan
+
+INSTRUMENTATION = real_config().instrumentation
+PMU_EVENTS = INSTRUMENTATION.pmu_events
+HARDWARE_EVENTS = INSTRUMENTATION.hardware_events
+SOFTWARE_EVENTS = tuple(event for event in PMU_EVENTS if event not in HARDWARE_EVENTS)
+METRICS = INSTRUMENTATION.metrics
+
+
+def counter_line(event: str, value: str, pcnt_running: float = 100.0) -> str:
+    return json.dumps(
+        {
+            "counter-value": value,
+            "unit": "",
+            "event": event,
+            "event-runtime": 1001233,
+            "pcnt-running": pcnt_running,
+            "metric-value": "0.000000",
+            "metric-unit": "(null)",
+        }
+    )
+
+
+def perf_output(values: dict[str, str], pcnt_running: float = 100.0) -> str:
+    return "\n".join(counter_line(event, value, pcnt_running) for event, value in values.items())
+
+
+def every_event_counted() -> dict[str, str]:
+    return {event: "1234567.000000" for event in PMU_EVENTS}
+
+
+def counted(values: dict[str, str], pcnt_running: float = 100.0):
+    return perf_counters(perf_output(values, pcnt_running), INSTRUMENTATION)
+
+
+def first_run() -> dict:
+    return build_canonical_plan(real_config())["blocks"][0]["runs"][0]
+
+
+class TestThePerfProbe:
+    def test_the_probe_asks_for_the_events_grouped_as_the_configuration_declares(self):
+        # O resto deste argv é argv de sistema e fica sem teste; o `-e`,
+        # não: transcrevê-lo aqui faria trocar um par no TOML mudar o que a
+        # campanha mede sem mudar o que o preflight confere.
+        argv = perf_probe_command(
+            run=first_run(),
+            event_spec=INSTRUMENTATION.event_spec,
+            repo_dir="/home/ubuntu/transcoding-bench",
+            work_dir="/home/ubuntu/work",
+        )
+
+        assert argv[argv.index("-e") + 1] == INSTRUMENTATION.event_spec
+
+    def test_the_probe_dumps_the_event_attribute_of_each_name(self):
+        argv = perf_probe_command(
+            run=first_run(),
+            event_spec=INSTRUMENTATION.event_spec,
+            repo_dir="/home/ubuntu/transcoding-bench",
+            work_dir="/home/ubuntu/work",
+        )
+
+        assert "-vv" in argv
+
+    def test_the_probe_runs_the_container_of_the_campaign(self):
+        # Mesmos mounts e mesma capability do `launch_container.sh`: um degrau só
+        # prova o que roda pelo mesmo caminho.
+        argv = perf_probe_command(
+            run=first_run(),
+            event_spec=INSTRUMENTATION.event_spec,
+            repo_dir="/home/ubuntu/transcoding-bench",
+            work_dir="/home/ubuntu/work",
+        )
+
+        assert "--cap-add=PERFMON" in argv
+        assert "/home/ubuntu/transcoding-bench/encode:/opt/encode:ro" in argv
+        assert "/home/ubuntu/work:/work" in argv
+
+    def test_the_probe_encodes_the_master_the_run_names(self):
+        # `-- true` termina em microssegundos: curto demais para o rodízio da PMU
+        # girar uma volta, e curto demais para um contador que responde zero
+        # provar coisa alguma.
+        run = first_run()
+        argv = probe_encode_argv(run)
+
+        assert argv[0] == "ffmpeg"
+        assert argv[argv.index("-i") + 1].endswith(f"/{run['master']}")
+        assert argv[argv.index("-t") + 1] == str(PROBE_SECONDS)
+
+    def test_the_probe_encodes_with_the_parameters_of_that_scenario(self):
+        run = first_run()
+        argv = probe_encode_argv(run)
+
+        assert argv[argv.index("-c:v") + 1] == run["encoder"]
+        assert argv[argv.index("-crf") + 1] == str(run["crf"])
+        assert argv[argv.index("-vf") + 1].startswith(
+            f"scale={run['output_width']}:{run['output_height']}"
+        )
+
+    def test_the_probe_writes_no_output(self):
+        # Segundos de encode no disco de uma instância descartável não são dado;
+        # o trabalho que a PMU conta é o mesmo com o muxer `null`.
+        assert probe_encode_argv(first_run())[-2:] == ["null", "/dev/null"]
+
+
+class TestThePerfCounters:
+    def test_the_ten_events_with_a_numeric_value_are_the_measurement(self):
+        measured = counted(every_event_counted())
+
+        assert list(measured) == list(PMU_EVENTS)
+        assert {counter.value for counter in measured.values()} == {1234567.0}
+
+    @pytest.mark.parametrize("event", PMU_EVENTS)
+    def test_not_supported_is_refused_naming_the_event(self, event):
+        # `perf stat` **não** sai não-zero quando o evento não existe naquela PMU,
+        # então quem só olha o código de saída dá o contador por
+        # aberto.
+        values = every_event_counted() | {event: NOT_SUPPORTED}
+
+        with pytest.raises(PreflightError, match=re.escape(event)) as refusal:
+            counted(values)
+        assert NOT_SUPPORTED in str(refusal.value)
+
+    @pytest.mark.parametrize("event", PMU_EVENTS)
+    def test_not_counted_is_refused_naming_the_event(self, event):
+        # O modo de falha do c7g, e distinto do anterior: o contador abriu e nunca
+        # rodou.
+        values = every_event_counted() | {event: NOT_COUNTED}
+
+        with pytest.raises(PreflightError, match=re.escape(event)) as refusal:
+            counted(values)
+        assert NOT_COUNTED in str(refusal.value)
+
+    @pytest.mark.parametrize("event", HARDWARE_EVENTS)
+    def test_a_zeroed_hardware_counter_is_refused_naming_the_event(self, event):
+        values = every_event_counted() | {event: "0.000000"}
+
+        with pytest.raises(PreflightError, match=re.escape(event)) as refusal:
+            counted(values)
+        assert "zero" in str(refusal.value)
+
+    @pytest.mark.parametrize("event", SOFTWARE_EVENTS)
+    def test_a_zeroed_software_counter_is_a_measurement(self, event):
+        # `context-switches = 0` e `cpu-migrations = 0` são resultados legítimos e
+        # desejáveis: recusá-los derrubaria todo run de uma instância ociosa.
+        values = every_event_counted() | {event: "0.000000"}
+
+        assert counted(values)[event].value == 0.0
+
+    @pytest.mark.parametrize("event", PMU_EVENTS)
+    def test_an_event_absent_from_the_output_is_refused_naming_it(self, event):
+        values = every_event_counted()
+        del values[event]
+
+        with pytest.raises(PreflightError, match=re.escape(event)):
+            counted(values)
+
+    @pytest.mark.parametrize("event", PMU_EVENTS)
+    def test_a_counter_value_that_is_not_a_number_is_refused_naming_the_event(self, event):
+        values = every_event_counted() | {event: ""}
+
+        with pytest.raises(PreflightError, match=re.escape(event)):
+            counted(values)
+
+    def test_every_event_without_a_counter_is_named_in_the_same_refusal(self):
+        values = every_event_counted() | dict.fromkeys(PMU_EVENTS[:3], NOT_SUPPORTED)
+
+        with pytest.raises(PreflightError) as refusal:
+            counted(values)
+        for event in PMU_EVENTS[:3]:
+            assert event in str(refusal.value)
+
+    def test_an_empty_output_is_refused_naming_every_event(self):
+        with pytest.raises(PreflightError) as refusal:
+            perf_counters("", INSTRUMENTATION)
+
+        for event in PMU_EVENTS:
+            assert event in str(refusal.value)
+
+    def test_the_header_the_perf_version_prints_is_ignored(self):
+        output = "\n".join(
+            ["# started on Fri Sep 11 18:00:00 2026", "", perf_output(every_event_counted())]
+        )
+
+        assert len(perf_counters(output, INSTRUMENTATION)) == len(PMU_EVENTS)
+
+    def test_the_modifier_perf_appends_to_the_event_still_counts(self):
+        # `perf` ecoa o evento com o modificador que aplicou (`cycles:u`), e uma
+        # comparação exata recusaria um contador que abriu.
+        values = {f"{event}:u": "7.000000" for event in PMU_EVENTS}
+
+        assert {event: counter.value for event, counter in counted(values).items()} == (
+            dict.fromkeys(PMU_EVENTS, 7.0)
+        )
+
+    def test_an_event_the_probe_did_not_ask_for_is_not_the_verdict(self):
+        values = every_event_counted() | {"duration_time": NOT_SUPPORTED}
+
+        assert len(counted(values)) == len(PMU_EVENTS)
+
+
+class TestTheMeasurementRegime:
+    def test_the_fraction_of_time_each_counter_ran_survives_the_reading(self):
+        measured = counted(every_event_counted(), pcnt_running=33.5)
+
+        assert {counter.pcnt_running for counter in measured.values()} == {33.5}
+
+    def test_a_counter_that_ran_a_fraction_of_the_time_is_not_a_refusal(self):
+        # Com os pares, fração abaixo de 100 é o regime **esperado** onde a PMU
+        # tem menos contadores que eventos: os dois membros do grupo veem a mesma
+        # janela, e a razão continua correta.
+        assert len(counted(every_event_counted(), pcnt_running=12.0)) == len(PMU_EVENTS)
+
+    def test_a_perf_that_does_not_report_the_fraction_still_counts(self):
+        raw = "\n".join(
+            json.dumps({"counter-value": "7.000000", "event": event}) for event in PMU_EVENTS
+        )
+
+        assert all(
+            counter.pcnt_running is None for counter in perf_counters(raw, INSTRUMENTATION).values()
+        )
+
+
+class TestPlausibility:
+    @pytest.mark.parametrize("metric", METRICS, ids=lambda metric: metric.name)
+    def test_a_ratio_past_the_declared_ceiling_is_refused_naming_it(self, metric):
+        values = every_event_counted() | {
+            metric.numerator: f"{1234567.0 * metric.max_ratio * 2:.6f}"
+        }
+
+        with pytest.raises(PreflightError, match=re.escape(metric.name)) as refusal:
+            counted(values)
+        assert metric.numerator in str(refusal.value)
+        assert metric.denominator in str(refusal.value)
+
+    @pytest.mark.parametrize("metric", METRICS, ids=lambda metric: metric.name)
+    def test_a_ratio_exactly_at_the_ceiling_passes(self, metric):
+        values = every_event_counted() | {metric.numerator: f"{1234567.0 * metric.max_ratio:.6f}"}
+
+        assert len(counted(values)) == len(PMU_EVENTS)
+
+    def test_the_counters_of_the_c7a_are_refused(self):
+        # Os quatro contadores da primeira rodada que sobreviveram à troca do par
+        # de cache, verbatim: IPC 18,6 e 942 % de desvios errados.
+        values = every_event_counted() | {
+            "cycles": "40210.000000",
+            "instructions": "746971.000000",
+            "branch-instructions": "146708.000000",
+            "branch-misses": "1382176.000000",
+        }
+
+        with pytest.raises(PreflightError) as refusal:
+            counted(values)
+        assert "ipc" in str(refusal.value)
+        assert "branch_mispredict_rate" in str(refusal.value)
+
+    def test_every_violated_ratio_is_named_in_the_same_refusal(self):
+        values = every_event_counted() | {
+            metric.numerator: f"{1234567.0 * metric.max_ratio * 2:.6f}" for metric in METRICS
+        }
+
+        with pytest.raises(PreflightError) as refusal:
+            counted(values)
+        for metric in METRICS:
+            assert metric.name in str(refusal.value)
+
+    def test_a_counter_without_a_value_is_reported_before_any_ratio(self):
+        values = every_event_counted() | {METRICS[0].denominator: NOT_SUPPORTED}
+
+        with pytest.raises(PreflightError) as refusal:
+            counted(values)
+        assert METRICS[0].name not in str(refusal.value)
+
+
+class TestTheDetailOfThePerfStep:
+    def test_the_line_lists_every_event_with_its_value(self):
+        detail = perf_detail(counted(every_event_counted()))
+
+        for event in PMU_EVENTS:
+            assert f"{event} = 1234567" in detail
+
+    def test_the_line_carries_the_regime_next_to_each_value(self):
+        detail = perf_detail(counted(every_event_counted(), pcnt_running=42.0))
+
+        assert detail.count("pcnt-running 42%") == len(PMU_EVENTS)
+
+    def test_the_line_survives_the_table(self):
+        detail = perf_detail(counted(every_event_counted()))
+        results = summarize([StepResult(Step.PERF, Outcome.PASSED, detail)])
+
+        line = next(
+            line for line in render_table(results).splitlines() if line.startswith(Step.PERF.value)
+        )
+        for event in PMU_EVENTS:
+            assert event in line
+
+
+def passed(step: Step, detail: str = "") -> StepResult:
+    return StepResult(step, Outcome.PASSED, detail)
+
+
+def topology_output(nproc: int, threads_per_core: int) -> str:
+    return "\n".join(
+        [
+            str(nproc),
+            "Architecture:             x86_64",
+            "CPU(s):                   8",
+            f"Thread(s) per core:       {threads_per_core}",
+            "Core(s) per socket:       4",
+            "Model name:               Intel(R) Xeon(R) Platinum 8488C",
+        ]
+    )
+
+
+NOSMT = CpuOptions(core_count=4, threads_per_core=1)
+
+
+class TestTheTopologyInsideTheContainer:
+    # O `nproc` é o que o FFmpeg com `-threads 0` enxerga, e o `lscpu` é o que diz
+    # se esses vCPUs são núcleos ou irmãos de SMT.
+
+    def test_the_declared_topology_passes(self):
+        seen = container_topology(topology_output(4, 1), NOSMT)
+
+        assert (seen.vcpus, seen.threads_per_core) == (4, 1)
+
+    def test_another_vcpu_count_is_refused_naming_both(self):
+        with pytest.raises(PreflightError, match=r"nproc.*8.*4"):
+            container_topology(topology_output(8, 1), NOSMT)
+
+    def test_smt_where_it_was_turned_off_is_refused_naming_both(self):
+        with pytest.raises(PreflightError, match=r"Thread\(s\) per core.*2.*1"):
+            container_topology(topology_output(4, 2), NOSMT)
+
+    def test_an_instance_that_declares_none_is_only_reported(self):
+        seen = container_topology(topology_output(4, 2), None)
+
+        assert topology_detail(seen) == "dentro do container: nproc 4, Thread(s) per core 2"
+
+    @pytest.mark.parametrize(
+        "raw", ["", "quatro\nThread(s) per core: 1", "4\nArchitecture: x86_64"]
+    )
+    def test_an_output_without_both_readings_is_refused(self, raw):
+        with pytest.raises(PreflightError):
+            container_topology(raw, None)
+
+
+class TestTheResultTable:
+    def test_a_step_that_did_not_run_is_neither_pass_nor_fail(self):
+        results = summarize([passed(ENCODE_STEPS[0])])
+
+        assert results[0].outcome is Outcome.PASSED
+        assert all(result.outcome is Outcome.SKIPPED for result in results[1:])
+
+    def test_every_declared_step_reaches_the_table(self):
+        assert tuple(result.step for result in summarize([])) == ENCODE_STEPS
+
+    def test_the_table_follows_the_declared_order_and_not_the_observed_one(self):
+        observed = [passed(ENCODE_STEPS[2]), passed(ENCODE_STEPS[0])]
+
+        assert tuple(result.step for result in summarize(observed)) == ENCODE_STEPS
+
+    def test_a_step_recorded_twice_is_refused(self):
+        with pytest.raises(PreflightError, match=ENCODE_STEPS[0].value):
+            summarize([passed(ENCODE_STEPS[0]), passed(ENCODE_STEPS[0])])
+
+    def test_a_failure_anywhere_is_a_failure(self):
+        results = summarize([StepResult(ENCODE_STEPS[0], Outcome.FAILED, "AccessDenied")])
+
+        assert failed(results) is True
+
+    def test_a_table_without_failures_passes_even_with_steps_that_did_not_run(self):
+        assert failed(summarize([passed(ENCODE_STEPS[0])])) is False
+
+    def test_a_full_table_of_passes_passes(self):
+        assert failed(summarize([passed(step) for step in ENCODE_STEPS])) is False
+
+
+class TestTheRenderedTable:
+    def test_every_step_gets_its_own_line(self):
+        rendered = render_table(summarize([]))
+
+        for step in ENCODE_STEPS:
+            lines = [line for line in rendered.splitlines() if line.startswith(step.value)]
+            assert len(lines) == 1
+
+    def test_the_outcome_and_the_detail_of_a_step_are_on_its_line(self):
+        results = summarize([StepResult(ENCODE_STEPS[0], Outcome.FAILED, "AccessDenied no sts")])
+
+        line = next(
+            line
+            for line in render_table(results).splitlines()
+            if line.startswith(ENCODE_STEPS[0].value)
+        )
+        assert Outcome.FAILED.value in line
+        assert "AccessDenied no sts" in line
+
+    def test_the_three_outcomes_read_differently(self):
+        assert len({outcome.value for outcome in Outcome}) == len(Outcome)
+
+    def test_the_outcome_column_is_aligned(self):
+        results = summarize(
+            [passed(ENCODE_STEPS[0], "detalhe"), StepResult(ENCODE_STEPS[-1], Outcome.FAILED, "")]
+        )
+        lines = render_table(results).splitlines()
+
+        columns = {line.index(line.split()[1]) for line in lines}
+        assert len(columns) == 1
+
+    def test_a_detail_of_several_lines_stays_in_its_cell(self):
+        # O detalhe de uma falha é o `stderr` do comando externo, e um
+        # `AccessDenied` da AWS CLI chega quebrado em linhas: solto, ele desmonta
+        # a tabela que o passo existe para imprimir.
+        results = summarize(
+            [StepResult(ENCODE_STEPS[0], Outcome.FAILED, "erro\n  na segunda linha")]
+        )
+
+        assert len(render_table(results).splitlines()) == len(ENCODE_STEPS) + 1
+
+    def test_no_line_carries_trailing_whitespace(self):
+        rendered = render_table(summarize([passed(ENCODE_STEPS[0], "detalhe")]))
+
+        assert rendered == "\n".join(line.rstrip() for line in rendered.splitlines())
+
+
+def vmaf_log(frames: int = 3, vmaf: object = 97.4) -> str:
+    return json.dumps(
+        {
+            "version": "3.0.0",
+            "fps": 12.5,
+            "frames": [
+                {"frameNum": index, "metrics": {"float_ssim": 0.99, "vmaf": vmaf}}
+                for index in range(frames)
+            ],
+            "pooled_metrics": {
+                "float_ssim": {"min": 0.99, "max": 0.99, "mean": 0.99, "harmonic_mean": 0.99},
+                "vmaf": {"min": vmaf, "max": vmaf, "mean": vmaf, "harmonic_mean": vmaf},
+            },
+            "aggregate_metrics": {},
+        }
+    )
+
+
+class TestTheVmafVerdict:
+    # O `libvmaf` que roda e não compara frame nenhum sai zero e deixa um log;
+    # quem só olha o status dá o `libvmaf` do container por provado.
+    def test_a_log_with_frames_and_a_numeric_vmaf_passes(self):
+        score = vmaf_score(vmaf_log(frames=3, vmaf=97.4))
+
+        assert score.frames == 3
+        assert score.vmaf == 97.4
+
+    def test_an_integer_vmaf_is_numeric(self):
+        assert vmaf_score(vmaf_log(vmaf=100)).vmaf == 100.0
+
+    def test_an_absent_log_is_refused_saying_so(self):
+        with pytest.raises(PreflightError, match="ausente"):
+            vmaf_score("")
+
+    def test_a_log_of_whitespace_is_absent(self):
+        with pytest.raises(PreflightError, match="ausente"):
+            vmaf_score("\n")
+
+    def test_a_log_that_is_not_json_is_refused_saying_so(self):
+        with pytest.raises(PreflightError, match="JSON"):
+            vmaf_score(vmaf_log()[:40])
+
+    def test_a_log_that_is_not_an_object_is_refused(self):
+        with pytest.raises(PreflightError, match="objeto"):
+            vmaf_score("[]")
+
+    def test_a_log_without_frames_is_refused_naming_them(self):
+        with pytest.raises(PreflightError, match="frames"):
+            vmaf_score(vmaf_log(frames=0))
+
+    def test_a_log_whose_frames_is_not_a_list_is_refused_naming_them(self):
+        raw = json.loads(vmaf_log())
+        raw["frames"] = 3
+
+        with pytest.raises(PreflightError, match="frames"):
+            vmaf_score(json.dumps(raw))
+
+    def test_a_log_missing_the_frames_is_refused_naming_them(self):
+        raw = json.loads(vmaf_log())
+        del raw["frames"]
+
+        with pytest.raises(PreflightError, match="frames"):
+            vmaf_score(json.dumps(raw))
+
+    @pytest.mark.parametrize("vmaf", ["97.4", None, True, float("nan")], ids=repr)
+    def test_a_vmaf_that_is_not_a_number_is_refused_naming_it(self, vmaf):
+        with pytest.raises(PreflightError, match="VMAF"):
+            vmaf_score(vmaf_log(vmaf=vmaf))
+
+    def test_a_log_without_the_pooled_vmaf_is_refused_naming_it(self):
+        raw = json.loads(vmaf_log())
+        del raw["pooled_metrics"]["vmaf"]
+
+        with pytest.raises(PreflightError, match="VMAF"):
+            vmaf_score(json.dumps(raw))
+
+    def test_a_log_without_pooled_metrics_is_refused_naming_the_vmaf(self):
+        raw = json.loads(vmaf_log())
+        del raw["pooled_metrics"]
+
+        with pytest.raises(PreflightError, match="VMAF"):
+            vmaf_score(json.dumps(raw))
+
+    def test_frames_are_judged_before_the_vmaf(self):
+        with pytest.raises(PreflightError, match="frames"):
+            vmaf_score(vmaf_log(frames=0, vmaf=None))
+
+    def test_the_line_carries_the_frames_and_the_vmaf(self):
+        detail = vmaf_detail(vmaf_score(vmaf_log(frames=125, vmaf=99.87)))
+
+        assert "125 frames" in detail
+        assert "99.87" in detail
+
+
+class TestTheJudgeTable:
+    def test_the_judge_leg_runs_the_self_check_first(self):
+        assert JUDGE_STEPS[: len(SELF_CHECK_STEPS)] == SELF_CHECK_STEPS
+
+    def test_the_judge_leg_has_its_own_lines(self):
+        assert JUDGE_STEPS[len(SELF_CHECK_STEPS) :] == (
+            Step.AMI,
+            Step.LAUNCH,
+            Step.BOOTSTRAP,
+            Step.VMAF,
+            Step.PUT,
+            Step.TERMINATE,
+        )
+
+    def test_the_encode_leg_is_unchanged(self):
+        assert ENCODE_STEPS[len(SELF_CHECK_STEPS) :] == (
+            Step.AMI,
+            Step.LAUNCH,
+            Step.BOOTSTRAP,
+            Step.TOPOLOGY,
+            Step.PERF,
+            Step.PUT,
+            Step.TERMINATE,
+        )
+
+    def test_neither_leg_shows_the_probe_of_the_other(self):
+        assert Step.PERF not in JUDGE_STEPS
+        assert Step.TOPOLOGY not in JUDGE_STEPS
+        assert Step.VMAF not in ENCODE_STEPS
+
+    def test_the_lines_of_the_judge_sit_next_to_the_self_check(self):
+        observed = [passed(step) for step in SELF_CHECK_STEPS]
+        observed += [passed(Step.AMI), StepResult(Step.LAUNCH, Outcome.FAILED, "PassRole")]
+        rendered = render_table(summarize(observed, JUDGE_STEPS)).splitlines()
+
+        assert [line.split()[0] for line in rendered[1:]] == [step.value for step in JUDGE_STEPS]
+
+    def test_a_judge_step_that_did_not_run_says_so(self):
+        observed = [passed(step) for step in SELF_CHECK_STEPS]
+        observed += [passed(Step.AMI), passed(Step.LAUNCH), passed(Step.BOOTSTRAP)]
+        observed += [StepResult(Step.VMAF, Outcome.FAILED, "log ausente")]
+        observed += [passed(Step.TERMINATE)]
+        results = summarize(observed, JUDGE_STEPS)
+
+        assert {result.step: result.outcome for result in results}[Step.PUT] is Outcome.SKIPPED
+        assert failed(results) is True
+
+    def test_the_vmaf_line_survives_the_table(self):
+        detail = vmaf_detail(vmaf_score(vmaf_log(frames=125, vmaf=99.87)))
+        results = summarize([StepResult(Step.VMAF, Outcome.PASSED, detail)], JUDGE_STEPS)
+
+        line = next(
+            line for line in render_table(results).splitlines() if line.startswith(Step.VMAF.value)
+        )
+        assert "99.87" in line

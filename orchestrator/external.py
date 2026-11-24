@@ -1,0 +1,433 @@
+"""A única casa de `subprocess.run` do Orquestrador."""
+
+from __future__ import annotations
+
+import json
+import shlex
+import subprocess
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+from command_output import (
+    CloudInitStatus,
+    DescribedInstance,
+    S3Object,
+    parse_caller_identity,
+    parse_cloud_init_status,
+    parse_describe_instances,
+    parse_get_parameter,
+    parse_list_objects,
+    parse_run_instances,
+)
+from experiment_config import CpuOptions
+from judgement_check import JUDGE_FILENAME
+
+# A AMI Ubuntu 24.04 expõe o volume raiz aqui; o `--block-device-mappings`
+# de um device que a AMI não declara é aceito e cria um volume extra, deixando o
+# raiz no tamanho default.
+ROOT_DEVICE_NAME = "/dev/sda1"
+
+VOLUME_TYPE = "gp3"
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# O default é `default`, que copia **tags** além da metadata — e para isso a CLI
+# chama `GetObjectTagging` na origem mesmo sem tag alguma, que a policy IAM do
+# papel não concede.
+COPY_PROPS = "metadata-directive"
+
+RUNS_PREFIX = "runs/"
+
+RUN_META_FILENAME = "meta.json"
+
+RUN_HASH_FILENAME = "output.sha256"
+
+QUALITY_RESULTS_PREFIX = "quality/results/"
+
+SSH_USER = "ubuntu"
+
+SSH_KEY_PATH = Path.home() / ".ssh" / "transcoding-bench.pem"
+
+SSH_CONNECT_TIMEOUT_SECONDS = 10
+SSH_KEEPALIVE_INTERVAL_SECONDS = 15
+SSH_KEEPALIVE_COUNT_MAX = 4
+
+# O `ssh` reserva o 255 para as falhas dele próprio; qualquer outro código veio
+# do comando remoto.
+SSH_UNREACHABLE_RETURNCODE = 255
+
+INSTANCE_NOT_FOUND_ERROR_CODE = "InvalidInstanceID.NotFound"
+
+# O `cloud-init status` sai 1 em `error` e 2 em `degraded`. Restringir a `(0,)`
+# faz uma instância que falhou o bootstrap chegar como falha de comando, e aí o
+# `BootstrapError` do laço de espera nunca dispara.
+CLOUD_INIT_RETURNCODES = (0, 1, 2)
+
+CLOUD_INIT_PROBE_TIMEOUT_SECONDS = 60.0
+
+
+class ExternalCommandError(Exception):
+    def __init__(self, message: str, *, returncode: int | None) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+
+
+def run_instances(
+    *,
+    instance_type: str,
+    image_id: str,
+    subnet_id: str,
+    security_group_id: str,
+    instance_profile: str,
+    key_name: str,
+    user_data: str,
+    volume_size_gb: int,
+    imds_hop_limit: int,
+    tags: Mapping[str, str],
+    cpu_options: CpuOptions | None,
+) -> str:
+    root_volume = [
+        {
+            "DeviceName": ROOT_DEVICE_NAME,
+            "Ebs": {
+                "VolumeSize": volume_size_gb,
+                "VolumeType": VOLUME_TYPE,
+                "DeleteOnTermination": True,
+            },
+        }
+    ]
+    metadata_options = {
+        "HttpEndpoint": "enabled",
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": imds_hop_limit,
+    }
+    tag_specifications = [
+        {
+            "ResourceType": "instance",
+            "Tags": [{"Key": key, "Value": value} for key, value in tags.items()],
+        }
+    ]
+    return parse_run_instances(
+        _run(
+            [
+                "aws",
+                "ec2",
+                "run-instances",
+                "--output",
+                "json",
+                "--count",
+                "1",
+                "--image-id",
+                image_id,
+                "--instance-type",
+                instance_type,
+                "--subnet-id",
+                subnet_id,
+                "--security-group-ids",
+                security_group_id,
+                "--iam-instance-profile",
+                json.dumps({"Name": instance_profile}),
+                "--key-name",
+                key_name,
+                "--user-data",
+                user_data,
+                "--block-device-mappings",
+                json.dumps(root_volume),
+                "--metadata-options",
+                json.dumps(metadata_options),
+                "--tag-specifications",
+                json.dumps(tag_specifications),
+                *_cpu_options_argv(cpu_options),
+            ]
+        )
+    )
+
+
+def _cpu_options_argv(cpu_options: CpuOptions | None) -> list[str]:
+    if cpu_options is None:
+        return []
+    return [
+        "--cpu-options",
+        json.dumps(
+            {"CoreCount": cpu_options.core_count, "ThreadsPerCore": cpu_options.threads_per_core}
+        ),
+    ]
+
+
+def terminate_instances(instance_ids: Sequence[str]) -> None:
+    _run(["aws", "ec2", "terminate-instances", "--output", "json", "--instance-ids", *instance_ids])
+
+
+def describe_instances(instance_ids: Sequence[str]) -> list[DescribedInstance]:
+    return parse_describe_instances(
+        _run(
+            [
+                "aws",
+                "ec2",
+                "describe-instances",
+                "--output",
+                "json",
+                "--instance-ids",
+                *instance_ids,
+            ]
+        )
+    )
+
+
+def described_instance(instance_id: str) -> DescribedInstance | None:
+    try:
+        described = describe_instances([instance_id])
+    except ExternalCommandError as error:
+        if INSTANCE_NOT_FOUND_ERROR_CODE in str(error):
+            return None
+        raise
+    return described[0] if described else None
+
+
+def s3_cp(source: str, destination: str) -> None:
+    _run(["aws", "s3", "cp", "--only-show-errors", source, destination])
+
+
+def s3_rm(target: str) -> None:
+    """Apaga um objeto — o `DeleteObject` que a policy IAM escopa a `runs/*`."""
+    _run(["aws", "s3", "rm", "--only-show-errors", target])
+
+
+def s3_sync(source: str, destination: str) -> None:
+    _run(
+        [
+            "aws",
+            "s3",
+            "sync",
+            "--only-show-errors",
+            "--copy-props",
+            COPY_PROPS,
+            source,
+            destination,
+        ]
+    )
+
+
+def s3_sync_run_metas(bucket: str, destination: Path) -> None:
+    _run(
+        [
+            "aws",
+            "s3",
+            "sync",
+            "--only-show-errors",
+            "--exclude",
+            "*",
+            "--include",
+            f"*/{RUN_META_FILENAME}",
+            f"s3://{bucket}/{RUNS_PREFIX}",
+            str(destination),
+        ]
+    )
+
+
+def s3_sync_run_metas_and_hashes(bucket: str, destination: Path) -> None:
+    """Os dois num `sync` só, e não o `meta.json` seguido dos hashes por Execução:
+    a árvore que o triage enumera tem de ser a mesma nos dois arquivos, e duas
+    passadas leriam `runs/` em instantes diferentes.
+    """
+    _run(
+        [
+            "aws",
+            "s3",
+            "sync",
+            "--only-show-errors",
+            "--exclude",
+            "*",
+            "--include",
+            f"*/{RUN_META_FILENAME}",
+            "--include",
+            f"*/{RUN_HASH_FILENAME}",
+            f"s3://{bucket}/{RUNS_PREFIX}",
+            str(destination),
+        ]
+    )
+
+
+def s3_sync_judgements(bucket: str, destination: Path) -> None:
+    _run(
+        [
+            "aws",
+            "s3",
+            "sync",
+            "--only-show-errors",
+            "--exclude",
+            "*",
+            "--include",
+            f"*/{JUDGE_FILENAME}",
+            f"s3://{bucket}/{QUALITY_RESULTS_PREFIX}",
+            str(destination),
+        ]
+    )
+
+
+def s3_list_prefix(bucket: str, prefix: str) -> list[S3Object]:
+    return parse_list_objects(
+        _run(
+            [
+                "aws",
+                "s3api",
+                "list-objects-v2",
+                "--output",
+                "json",
+                "--bucket",
+                bucket,
+                "--prefix",
+                prefix,
+            ]
+        )
+    )
+
+
+def sts_caller_identity() -> str:
+    """O ARN da identidade corrente, sem permissão nenhuma exigida para perguntar."""
+    return parse_caller_identity(_run(["aws", "sts", "get-caller-identity", "--output", "json"]))
+
+
+def ssm_get_parameter(name: str) -> str:
+    return parse_get_parameter(
+        _run(
+            [
+                "aws",
+                "ssm",
+                "get-parameter",
+                "--output",
+                "json",
+                "--name",
+                name,
+                "--with-decryption",
+            ]
+        )
+    )
+
+
+@dataclass(frozen=True)
+class CommandOutput:
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+def ssh_capture(
+    host: str,
+    command: Sequence[str],
+    *,
+    key_path: Path = SSH_KEY_PATH,
+    timeout: float | None = None,
+) -> CommandOutput:
+    completed = _run_capture(
+        _ssh_argv(host, command, key_path=key_path),
+        allowed_returncodes=None,
+        timeout=timeout,
+    )
+    if completed.returncode == SSH_UNREACHABLE_RETURNCODE:
+        raise ExternalCommandError(
+            f"ssh {host} falhou (exit {completed.returncode}): {completed.stderr.strip()}",
+            returncode=completed.returncode,
+        )
+    return CommandOutput(
+        stdout=completed.stdout, stderr=completed.stderr, returncode=completed.returncode
+    )
+
+
+def ssh_exec(
+    host: str,
+    command: Sequence[str],
+    *,
+    key_path: Path = SSH_KEY_PATH,
+    allowed_returncodes: Sequence[int] = (0,),
+    timeout: float | None = None,
+) -> str:
+    return _run(
+        _ssh_argv(host, command, key_path=key_path),
+        allowed_returncodes=allowed_returncodes,
+        timeout=timeout,
+    )
+
+
+def _ssh_argv(host: str, command: Sequence[str], *, key_path: Path) -> list[str]:
+    return [
+        "ssh",
+        "-i",
+        str(key_path),
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}",
+        "-o",
+        f"ServerAliveInterval={SSH_KEEPALIVE_INTERVAL_SECONDS}",
+        "-o",
+        f"ServerAliveCountMax={SSH_KEEPALIVE_COUNT_MAX}",
+        f"{SSH_USER}@{host}",
+        shlex.join(command),
+    ]
+
+
+def cloud_init_status(host: str, *, key_path: Path = SSH_KEY_PATH) -> CloudInitStatus | None:
+    try:
+        output = ssh_exec(
+            host,
+            ["cloud-init", "status"],
+            key_path=key_path,
+            allowed_returncodes=CLOUD_INIT_RETURNCODES,
+            timeout=CLOUD_INIT_PROBE_TIMEOUT_SECONDS,
+        )
+    except ExternalCommandError as error:
+        if error.returncode == SSH_UNREACHABLE_RETURNCODE:
+            return None
+        raise
+    return parse_cloud_init_status(output)
+
+
+def git_rev_parse(ref: str = "HEAD") -> str:
+    """Do clone que contém este arquivo, e não do diretório corrente: o SHA é o do
+    código que está rodando, e sem o `-C` ele passaria a ser o de onde quer que o
+    CLI tenha sido invocado.
+    """
+    return _run(["git", "-C", str(REPO_ROOT), "rev-parse", "--verify", ref]).strip()
+
+
+def _run(
+    argv: Sequence[str],
+    *,
+    allowed_returncodes: Sequence[int] = (0,),
+    timeout: float | None = None,
+) -> str:
+    return _run_capture(argv, allowed_returncodes=allowed_returncodes, timeout=timeout).stdout
+
+
+def _run_capture(
+    argv: Sequence[str],
+    *,
+    allowed_returncodes: Sequence[int] | None = (0,),
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ExternalCommandError(
+            f"{_command_name(argv)} não respondeu em {timeout:g}s", returncode=None
+        ) from error
+
+    if allowed_returncodes is not None and completed.returncode not in allowed_returncodes:
+        raise ExternalCommandError(
+            f"{_command_name(argv)} falhou (exit {completed.returncode}): "
+            f"{completed.stderr.strip()}",
+            returncode=completed.returncode,
+        )
+    return completed
+
+
+def _command_name(argv: Sequence[str]) -> str:
+    # Só o nome do subcomando: o argv inteiro carrega o user-data e o comando
+    # remoto, e o que resolve um `AccessDenied` é o `stderr`.
+    return " ".join(argv[:3])

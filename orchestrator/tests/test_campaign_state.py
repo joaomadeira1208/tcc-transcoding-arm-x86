@@ -1,0 +1,386 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import pytest
+from campaign_state import StateError, TrackedInstance, appended, parse_state, serialize_state
+from conftest import (
+    ABSENT,
+    make_campaign_state,
+    make_done_marker,
+    make_judge_progress,
+    make_progress,
+    make_tracked_instance,
+)
+from experiment_config import CpuOptions
+from status_check import Role, StatusError
+from vigilance import Vigilance
+
+TOP_FIELDS = ("bucket", "config_path", "commit", "total_timeout", "slice_keys", "instances")
+
+TRACKED_FIELDS = (
+    "instance",
+    "instance_id",
+    "instance_type",
+    "pid",
+    "block_count",
+    "runs_total",
+    "state",
+    "outcome",
+)
+
+
+def deformed(**overrides: Any) -> dict[str, Any]:
+    state = make_campaign_state()
+    state["instances"][1] = make_tracked_instance(**overrides)
+    return state
+
+
+def message(payload: Any) -> str:
+    with pytest.raises(StateError) as raised:
+        parse_state(payload)
+    return str(raised.value)
+
+
+def only(**overrides: Any) -> TrackedInstance:
+    listed = [make_tracked_instance(**overrides)]
+    return parse_state(make_campaign_state(instances=listed)).instances[0]
+
+
+class TestTheFileTheRunWrites:
+    def test_the_documented_shape_is_accepted(self):
+        state = parse_state(make_campaign_state())
+
+        assert state.bucket == "transcoding-bench-123456789012-pilot"
+        assert state.config_path == "config/pilot.toml"
+        assert state.commit == "ffd4f43a1b2c3d4e5f60718293a4b5c6d7e8f900"
+        assert state.slice_keys == ("scenarios/c7g.json", "scenarios/c7i.json")
+
+    def test_the_fields_the_vigilance_asks_the_three_questions_with(self):
+        state = parse_state(make_campaign_state())
+
+        assert state.instances[0] == TrackedInstance(
+            role=Role.ENCODE,
+            instance="c7g",
+            instance_id="i-0123456789abcdef0",
+            instance_type="c7g.xlarge",
+            pid=4242,
+            block_count=6,
+            runs_total=36,
+            commit="ffd4f43a1b2c3d4e5f60718293a4b5c6d7e8f900",
+            total_timeout=120 * 60 * 60,
+            state=Vigilance.RUNNING,
+            outcome=None,
+            cpu_options=None,
+        )
+
+    def test_the_architecture_that_finished_keeps_the_marker_that_ended_it(self):
+        listed = [make_tracked_instance(state="finished", outcome=make_done_marker(runs_failed=2))]
+
+        outcome = parse_state(make_campaign_state(instances=listed)).instances[0].outcome
+
+        assert outcome is not None
+        assert outcome.runs_failed == 2
+
+    def test_the_cap_the_launch_promised_each_instance_survives_in_the_file(self):
+        assert parse_state(make_campaign_state()).total_timeout == 120 * 60 * 60
+
+    def test_an_architecture_launched_and_not_yet_dispatched_has_no_pid(self):
+        state = parse_state(make_campaign_state())
+
+        assert state.instances[1].pid is None
+        assert state.instances[1].state is Vigilance.BOOTSTRAPPING
+
+    def test_the_file_written_before_the_first_launch_lists_the_slices_and_no_instance(self):
+        state = parse_state(make_campaign_state(instances=[]))
+
+        assert state.slice_keys == ("scenarios/c7g.json", "scenarios/c7i.json")
+        assert state.instances == ()
+
+
+class TestTheFieldsItRefuses:
+    def test_a_payload_that_is_not_an_object_is_refused(self):
+        assert "estado" in message([])
+
+    @pytest.mark.parametrize("field", TOP_FIELDS)
+    def test_a_missing_field_is_refused_by_name(self, field):
+        assert field in message(make_campaign_state(**{field: ABSENT}))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("bucket", ""),
+            ("bucket", None),
+            ("config_path", 42),
+            ("commit", ""),
+            ("total_timeout", "432000"),
+            ("total_timeout", 0),
+            ("total_timeout", -1),
+            ("slice_keys", "scenarios/c7g.json"),
+            ("instances", {}),
+            ("instances", "c7g"),
+        ],
+    )
+    def test_a_field_of_the_wrong_type_is_refused_by_name(self, field, value):
+        assert field in message(make_campaign_state(**{field: value}))
+
+    @pytest.mark.parametrize("key", ["", None, ["scenarios/c7i.json"]])
+    def test_a_slice_key_that_is_not_a_key_is_refused_by_index(self, key):
+        listed = ["scenarios/c7g.json", key]
+
+        assert "slice_keys[1]" in message(make_campaign_state(slice_keys=listed))
+
+    def test_an_architecture_that_is_not_an_object_is_refused_by_index(self):
+        listed = [make_tracked_instance(), "c7i"]
+
+        assert "instances[1]" in message(make_campaign_state(instances=listed))
+
+    @pytest.mark.parametrize("field", TRACKED_FIELDS)
+    def test_an_architecture_missing_a_field_is_refused_by_index_and_name(self, field):
+        assert f"instances[1].{field}" in message(deformed(**{field: ABSENT}))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("instance", ""),
+            ("instance_id", ""),
+            ("instance_id", None),
+            ("instance_type", 7),
+            ("pid", "4242"),
+            ("pid", True),
+            ("pid", 0),
+            ("pid", -1),
+            ("block_count", "6"),
+            ("block_count", 6.0),
+            ("runs_total", True),
+            ("commit", ""),
+            ("total_timeout", 0),
+            ("total_timeout", "86400"),
+            ("state", "acordada"),
+            ("state", None),
+            ("outcome", "done"),
+        ],
+    )
+    def test_an_architecture_field_of_the_wrong_type_is_refused_by_index_and_name(
+        self, field, value
+    ):
+        assert f"instances[1].{field}" in message(deformed(**{field: value}))
+
+    def test_a_deformed_marker_is_refused_by_the_reader_that_owns_it(self):
+        assert "capped" in message(deformed(outcome=make_done_marker(capped="false")))
+
+    def test_the_marker_of_a_previous_attempt_is_refused_instead_of_ignored(self):
+        stale = make_done_marker(instance_id="i-0fedcba9876543210")
+
+        assert "outra instância" in message(deformed(outcome=stale))
+
+
+class TestTheRoundTrip:
+    def test_what_the_run_writes_the_watch_reads(self):
+        state = parse_state(make_campaign_state())
+
+        assert parse_state(json.loads(serialize_state(state))) == state
+
+    def test_serializing_what_was_parsed_reproduces_the_file(self):
+        payload = make_campaign_state()
+
+        assert json.loads(serialize_state(parse_state(payload))) == payload
+
+    def test_the_bytes_do_not_depend_on_the_order_the_file_had(self):
+        payload = make_campaign_state()
+        shuffled = {
+            **{field: payload[field] for field in reversed(TOP_FIELDS)},
+            "instances": [dict(reversed(list(each.items()))) for each in payload["instances"]],
+        }
+
+        assert serialize_state(parse_state(shuffled)) == serialize_state(parse_state(payload))
+
+    def test_the_marker_survives_the_round_trip_of_a_watch_that_restarted(self):
+        listed = [make_tracked_instance(state="finished", outcome=make_done_marker(capped=True))]
+        state = parse_state(make_campaign_state(instances=listed))
+
+        assert parse_state(json.loads(serialize_state(state))) == state
+
+    def test_the_file_ends_in_a_newline(self):
+        assert serialize_state(parse_state(make_campaign_state())).endswith("}\n")
+
+
+class TestTheRoleTheEntryCarries:
+    def test_the_entry_of_the_pilot_which_predates_the_field_is_an_encode(self):
+        assert only(role=ABSENT).role is Role.ENCODE
+
+    def test_the_file_of_the_pilot_is_rewritten_with_the_role_it_was_read_as(self):
+        state = parse_state(make_campaign_state(instances=[make_tracked_instance(role=ABSENT)]))
+
+        assert json.loads(serialize_state(state))["instances"][0]["role"] == "encode"
+
+    def test_the_role_survives_the_round_trip_of_a_watch_that_restarted(self):
+        state = parse_state(make_campaign_state(instances=[make_tracked_instance(role="judge")]))
+
+        assert parse_state(json.loads(serialize_state(state))) == state
+
+    def test_a_role_that_is_not_a_role_is_refused_by_index_and_name(self):
+        assert "instances[1].role" in message(deformed(role="juiz"))
+
+
+class TestTheStatusObjectsTheEntryNames:
+    def test_the_encode_names_them_after_the_instance_of_its_slice(self):
+        keys = only(instance="c7g", instance_type="c7g.xlarge").status_keys
+
+        assert (keys.done, keys.progress) == ("status/c7g_done", "status/c7g_progress")
+
+    def test_two_entries_of_the_same_type_name_different_objects(self):
+        first = only(instance="c7g-r1", instance_type="c7g.xlarge").status_keys
+        second = only(instance="c7g-r2", instance_type="c7g.xlarge").status_keys
+
+        assert {first.done, first.progress}.isdisjoint({second.done, second.progress})
+
+    def test_the_judge_names_them_after_itself_and_not_after_its_instance_type(self):
+        keys = only(role="judge", instance_type="c7i.4xlarge").status_keys
+
+        assert (keys.done, keys.progress) == ("status/judge_done", "status/judge_progress")
+
+
+class TestTheProgressTheEntryReadsAndPrints:
+    def test_the_entry_reads_the_object_of_its_own_instance(self):
+        progress = only().read_progress(make_progress())
+
+        assert progress is not None
+        assert progress.runs_total == 21
+
+    def test_the_object_of_a_previous_attempt_is_not_this_entrys(self):
+        stale = make_progress(instance_id="i-0fedcba9876543210")
+
+        assert only().read_progress(stale) is None
+
+    def test_the_line_it_prints_carries_the_total_of_runs_of_its_own_slice(self):
+        each = only()
+
+        assert "21/36 runs" in each.render_progress(each.read_progress(make_progress()))
+
+    def test_the_entry_without_an_object_yet_still_has_a_line(self):
+        assert "sem progresso ainda" in only().render_progress(None)
+
+
+class TestTheLaunchTheEntryCameFrom:
+    def test_the_entry_of_the_pilot_which_predates_them_takes_the_launch_of_the_file(self):
+        state = parse_state(
+            make_campaign_state(
+                commit="0" * 40,
+                total_timeout=7200,
+                instances=[make_tracked_instance(commit=ABSENT, total_timeout=ABSENT)],
+            )
+        )
+
+        assert (state.instances[0].commit, state.instances[0].total_timeout) == ("0" * 40, 7200)
+
+    def test_the_file_of_the_pilot_is_rewritten_with_what_it_was_read_as(self):
+        listed = [make_tracked_instance(commit=ABSENT, total_timeout=ABSENT)]
+        state = parse_state(make_campaign_state(instances=listed))
+
+        rewritten = json.loads(serialize_state(state))["instances"][0]
+
+        assert (rewritten["commit"], rewritten["total_timeout"]) == (
+            state.commit,
+            state.total_timeout,
+        )
+
+    def test_an_entry_launched_on_another_commit_keeps_its_own(self):
+        listed = [make_tracked_instance(commit="1" * 40, total_timeout=86400)]
+        entry = parse_state(make_campaign_state(instances=listed)).instances[0]
+
+        assert (entry.commit, entry.total_timeout) == ("1" * 40, 86400)
+
+
+class TestTheJudgeEntryReadsAndPrintsItsOwnProgress:
+    def test_the_judge_reads_the_object_of_the_judge(self):
+        progress = only(role="judge").read_progress(make_judge_progress())
+
+        assert progress is not None
+        assert progress.output_index == 7
+
+    def test_the_object_of_a_previous_pass_is_not_this_judges(self):
+        stale = make_judge_progress(instance_id="i-0fedcba9876543210")
+
+        assert only(role="judge").read_progress(stale) is None
+
+    def test_the_progress_of_an_encode_is_refused_by_the_reader_of_the_judge(self):
+        with pytest.raises(StatusError, match="output_index"):
+            only(role="judge").read_progress(make_progress())
+
+    def test_the_line_it_prints_is_the_line_of_the_judge(self):
+        judge = only(role="judge", instance="judge")
+
+        line = judge.render_progress(judge.read_progress(make_judge_progress()))
+
+        assert "output  7/13" in line
+
+    def test_the_judge_without_an_object_yet_says_no_output_was_judged(self):
+        assert "nenhum output julgado" in only(role="judge").render_progress(None)
+
+
+class TestTheTopologyTheEntryWasLaunchedWith:
+    def test_the_applied_topology_survives_the_round_trip(self):
+        applied = {"core_count": 4, "threads_per_core": 1}
+        state = parse_state(
+            make_campaign_state(instances=[make_tracked_instance(cpu_options=applied)])
+        )
+
+        assert state.instances[0].cpu_options == CpuOptions(core_count=4, threads_per_core=1)
+        assert parse_state(json.loads(serialize_state(state))) == state
+
+    def test_the_entry_of_the_campaign_which_predates_the_field_has_none(self):
+        assert only(cpu_options=ABSENT).cpu_options is None
+
+    @pytest.mark.parametrize(
+        "value", ["4x1", {"core_count": 4}, {"core_count": "4", "threads_per_core": 1}]
+    )
+    def test_a_topology_that_is_not_one_is_refused_by_index_and_name(self, value):
+        assert "instances[1].cpu_options" in message(deformed(cpu_options=value))
+
+
+class TestTheEntryAppendedToTheFile:
+    def judge(self) -> TrackedInstance:
+        return only(
+            role="judge",
+            instance="judge",
+            instance_id="i-0aaaaaaaaaaaaaaaa",
+            instance_type="c7i.4xlarge",
+            pid=None,
+            block_count=0,
+            runs_total=13,
+            commit="1" * 40,
+            total_timeout=86400,
+            state="bootstrapping",
+        )
+
+    def test_the_campaign_already_recorded_is_preserved(self):
+        campaign = parse_state(make_campaign_state())
+
+        state = appended(campaign, self.judge())
+
+        assert state.instances[:-1] == campaign.instances
+        assert (state.bucket, state.commit, state.total_timeout, state.slice_keys) == (
+            campaign.bucket,
+            campaign.commit,
+            campaign.total_timeout,
+            campaign.slice_keys,
+        )
+
+    def test_the_judge_is_the_last_entry(self):
+        state = appended(parse_state(make_campaign_state()), self.judge())
+
+        assert state.instances[-1] == self.judge()
+
+    def test_the_appended_file_round_trips_through_the_watch(self):
+        state = appended(parse_state(make_campaign_state()), self.judge())
+
+        assert parse_state(json.loads(serialize_state(state))) == state
+
+    def test_a_file_born_with_the_judge_alone_round_trips_too(self):
+        state = appended(
+            parse_state(make_campaign_state(instances=[], slice_keys=[])), self.judge()
+        )
+
+        assert parse_state(json.loads(serialize_state(state))).instances == (self.judge(),)
